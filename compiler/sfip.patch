@@ -1,0 +1,3948 @@
+diff --git a/clang/CMakeLists.txt b/clang/CMakeLists.txt
+index 781c3eb7f2f..4eccb22d4c2 100644
+--- a/clang/CMakeLists.txt
++++ b/clang/CMakeLists.txt
+@@ -226,7 +226,7 @@ set(C_INCLUDE_DIRS "" CACHE STRING
+   "Colon separated list of directories clang will search for headers.")
+ 
+ set(GCC_INSTALL_PREFIX "" CACHE PATH "Directory where gcc is installed." )
+-set(DEFAULT_SYSROOT "" CACHE PATH
++set(DEFAULT_SYSROOT "" CACHE STRING
+   "Default <path> to all compiler invocations for --sysroot=<path>." )
+ 
+ set(ENABLE_LINKER_BUILD_ID OFF CACHE BOOL "pass --build-id to ld")
+diff --git a/clang/include/clang/Basic/CodeGenOptions.def b/clang/include/clang/Basic/CodeGenOptions.def
+index 1ecae98b13b..877a4f8baec 100644
+--- a/clang/include/clang/Basic/CodeGenOptions.def
++++ b/clang/include/clang/Basic/CodeGenOptions.def
+@@ -385,6 +385,9 @@ CODEGENOPT(BranchTargetEnforcement, 1, 0)
+ /// Whether to emit unused static constants.
+ CODEGENOPT(KeepStaticConsts, 1, 0)
+ 
++/// Embeds the call hierarchy into the IR as note.
++CODEGENOPT(EmbedCallHierarchy, 1, 0)
++
+ #undef CODEGENOPT
+ #undef ENUM_CODEGENOPT
+ #undef VALUE_CODEGENOPT
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index 0a60873443f..eb74522316d 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -1235,6 +1235,17 @@ def fexperimental_isel : Flag<["-"], "fexperimental-isel">, Group<f_clang_Group>
+ def fexperimental_new_pass_manager : Flag<["-"], "fexperimental-new-pass-manager">,
+   Group<f_clang_Group>, Flags<[CC1Option]>,
+   HelpText<"Enables an experimental new pass manager in LLVM.">;
++def fautosandbox : Flag<["-"], "fautosandbox">,
++  Group<f_Group>, Flags<[DriverOption]>,
++  HelpText<"Enable automatic syscall sandboxing (implies -fembed-callhierarchy).">;
++def fautosandbox_state : Flag<["-"], "fautosandbox-state">,
++  Group<f_Group>, Flags<[DriverOption]>,
++  HelpText<"Enable automatic state syscall sandboxing (implies -fembed-callhierarchy).">;
++def fembed_callhierarchy : Flag<["-"], "fembed-callhierarchy">,
++  Group<f_Group>, Flags<[DriverOption,CC1Option]>,
++  HelpText<"Embed the call hierarchy analysis result into a note section in IR.">;
++def fnoembed_callhierarchy : Flag<["-"], "fno-embed-callhierarchy">,
++  Group<f_Group>, Flags<[DriverOption,CC1Option]>;
+ def finput_charset_EQ : Joined<["-"], "finput-charset=">, Group<f_Group>;
+ def fexec_charset_EQ : Joined<["-"], "fexec-charset=">, Group<f_Group>;
+ def finstrument_functions : Flag<["-"], "finstrument-functions">, Group<f_Group>, Flags<[CC1Option]>,
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index 0bfcab88a3a..b4738ac878a 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -57,6 +57,7 @@
+ #include "llvm/Transforms/Instrumentation.h"
+ #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
+ #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
++#include "llvm/Transforms/Instrumentation/CallHierarchy.h"
+ #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
+ #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
+ #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
+@@ -1249,6 +1250,9 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
+     if (CodeGenOpts.OptimizationLevel == 0) {
+       addSanitizersAtO0(MPM, TargetTriple, LangOpts, CodeGenOpts);
+     }
++
++    if (CodeGenOpts.EmbedCallHierarchy)
++      MPM.addPass(CallHierarchyPass());
+   }
+ 
+   // FIXME: We still use the legacy pass manager to do code generation. We
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index fb8335a3695..56c9ea76ac7 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -131,6 +131,16 @@ Driver::Driver(StringRef ClangExecutable, StringRef TargetTriple,
+       TargetTriple(TargetTriple), CCCGenericGCCName(""), Saver(Alloc),
+       CheckInputsExist(true), GenReproducer(false),
+       SuppressMissingInputWarning(false) {
++  // Sloppy way to enable the use of a relative path (based on directory with
++  // the clang binary) as default sysroot.
++  if(SysRoot != "") {
++    if (llvm::sys::path::is_relative(SysRoot)) {
++      std::string Dir = llvm::sys::path::parent_path(ClangExecutable);
++      SmallString<128> P(Dir);
++      llvm::sys::path::append(P, SysRoot);
++      SysRoot = P.str();
++    }
++  }
+ 
+   // Provide a sane fallback if no VFS is specified.
+   if (!this->VFS)
+@@ -1074,6 +1084,14 @@ Compilation *Driver::BuildCompilation(ArrayRef<const char *> ArgList) {
+     A->claim();
+     PrefixDirs.push_back(A->getValue(0));
+   }
++  // If undefined, setup the default sysroot based on the target triple.
++  if (SysRoot == "") {
++    std::string Dir = llvm::sys::path::parent_path(ClangExecutable);
++    SmallString<128> P(Dir);
++    llvm::sys::path::append(P, "..", TargetTriple);
++    if (llvm::sys::fs::is_directory(P))
++      SysRoot = P.str();
++  }
+   if (const Arg *A = Args.getLastArg(options::OPT__sysroot_EQ))
+     SysRoot = A->getValue();
+   if (const Arg *A = Args.getLastArg(options::OPT__dyld_prefix_EQ))
+diff --git a/clang/lib/Driver/ToolChain.cpp b/clang/lib/Driver/ToolChain.cpp
+index cab97b1a601..75c632d9afe 100644
+--- a/clang/lib/Driver/ToolChain.cpp
++++ b/clang/lib/Driver/ToolChain.cpp
+@@ -895,6 +895,7 @@ void ToolChain::AddCXXStdlibLibArgs(const ArgList &Args,
+   switch (Type) {
+   case ToolChain::CST_Libcxx:
+     CmdArgs.push_back("-lc++");
++    CmdArgs.push_back("-lc++abi"); // FIXME HACK to enable static builds
+     break;
+ 
+   case ToolChain::CST_Libstdcxx:
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index fa025be14e4..5407ca75a5b 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -5454,6 +5454,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+   Args.AddLastArg(CmdArgs, options::OPT_fexperimental_new_pass_manager,
+                   options::OPT_fno_experimental_new_pass_manager);
+ 
++  // Enable call hierarchy embedding in the compiler.
++  if (Args.hasArg(options::OPT_fautosandbox) || Args.hasArg(options::OPT_fautosandbox_state) ||
++      Args.hasFlag(options::OPT_fembed_callhierarchy,
++                   options::OPT_fnoembed_callhierarchy, false))
++    CmdArgs.push_back("-fembed-callhierarchy");
++  else
++    CmdArgs.push_back("-fno-embed-callhierarchy");
++
+   ObjCRuntime Runtime = AddObjCRuntimeArgs(Args, CmdArgs, rewriteKind);
+   RenderObjCOptions(TC, D, RawTriple, Args, Runtime, rewriteKind != RK_None,
+                     Input, CmdArgs);
+diff --git a/clang/lib/Driver/ToolChains/Gnu.cpp b/clang/lib/Driver/ToolChains/Gnu.cpp
+index da197e47662..395912bb52d 100644
+--- a/clang/lib/Driver/ToolChains/Gnu.cpp
++++ b/clang/lib/Driver/ToolChains/Gnu.cpp
+@@ -453,6 +453,14 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+     }
+   }
+ 
++  // Enable call hierarchy processing in the linker.
++  if (Args.hasArg(options::OPT_fautosandbox) || Args.hasArg(options::OPT_fautosandbox_state) ||
++      Args.hasFlag(options::OPT_fembed_callhierarchy,
++                   options::OPT_fnoembed_callhierarchy, false))
++    CmdArgs.push_back("-fembed-callhierarchy");
++  else
++    CmdArgs.push_back("-fno-embed-callhierarchy");
++
+   CmdArgs.push_back("-o");
+   CmdArgs.push_back(Output.getFilename());
+ 
+@@ -475,6 +483,21 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+       CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crti.o")));
+     }
+ 
++    // Add the state filter object to executables when autosandboxing is enabled.
++    if (Args.hasArg(options::OPT_fautosandbox_state) &&
++        !Args.hasArg(options::OPT_shared)) {
++      CmdArgs.push_back(
++          Args.MakeArgString(ToolChain.GetFilePath("filter.o")));
++      CmdArgs.push_back(
++          Args.MakeArgString(ToolChain.GetFilePath("cJSON.o")));
++    }
++
++    // Add the sandboxing object to executables when autosandboxing is enabled.
++    if (Args.hasArg(options::OPT_fautosandbox) &&
++        !Args.hasArg(options::OPT_shared))
++      CmdArgs.push_back(
++          Args.MakeArgString(ToolChain.GetFilePath("sandboxing.o")));
++
+     if (IsIAMCU)
+       CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crt0.o")));
+     else if (HasCRTBeginEndFiles) {
+@@ -594,6 +617,11 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+         CmdArgs.push_back("-lsoftfp");
+         CmdArgs.push_back("--no-as-needed");
+       }
++
++      // Link against libseccomp when building executables with autosandboxing.
++      if (Args.hasArg(options::OPT_fautosandbox) &&
++          !Args.hasArg(options::OPT_shared))
++        CmdArgs.push_back("-lseccomp");
+     }
+ 
+     if (!Args.hasArg(options::OPT_nostartfiles) && !IsIAMCU) {
+@@ -2714,6 +2742,8 @@ Generic_GCC::addLibCxxIncludePaths(const llvm::opt::ArgList &DriverArgs,
+     addSystemInclude(DriverArgs, CC1Args, IncludePath);
+     return true;
+   };
++  if (AddIncludePath(SysRoot + "/include/c++"))
++    return;
+   // Android never uses the libc++ headers installed alongside the toolchain,
+   // which are generally incompatible with the NDK libraries anyway.
+   if (!getTriple().isAndroid())
+diff --git a/clang/lib/Frontend/CompilerInvocation.cpp b/clang/lib/Frontend/CompilerInvocation.cpp
+index e98a407ac42..003f7d5b7d2 100644
+--- a/clang/lib/Frontend/CompilerInvocation.cpp
++++ b/clang/lib/Frontend/CompilerInvocation.cpp
+@@ -769,6 +769,7 @@ static bool ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args, InputKind IK,
+   Opts.DebugExplicitImport = Args.hasArg(OPT_dwarf_explicit_import);
+   Opts.DebugFwdTemplateParams = Args.hasArg(OPT_debug_forward_template_params);
+   Opts.EmbedSource = Args.hasArg(OPT_gembed_source);
++  Opts.EmbedCallHierarchy = Args.hasFlag(OPT_fembed_callhierarchy, OPT_fnoembed_callhierarchy, false);
+ 
+   Opts.ForceDwarfFrameSection =
+       Args.hasFlag(OPT_fforce_dwarf_frame, OPT_fno_force_dwarf_frame, false);
+diff --git a/lld/ELF/CMakeLists.txt b/lld/ELF/CMakeLists.txt
+index b89f4436288..a9da207db6f 100644
+--- a/lld/ELF/CMakeLists.txt
++++ b/lld/ELF/CMakeLists.txt
+@@ -24,6 +24,7 @@ add_lld_library(lldELF
+   Arch/X86_64.cpp
+   ARMErrataFix.cpp
+   CallGraphSort.cpp
++  CallHierarchy.cpp
+   DWARF.cpp
+   Driver.cpp
+   DriverUtils.cpp
+diff --git a/lld/ELF/CallHierarchy.cpp b/lld/ELF/CallHierarchy.cpp
+new file mode 100644
+index 00000000000..f66714d16c0
+--- /dev/null
++++ b/lld/ELF/CallHierarchy.cpp
+@@ -0,0 +1,1548 @@
++#include "CallHierarchy.h"
++#include "InputSection.h"
++#include "Symbols.h"
++#include "SyntheticSections.h"
++#include "lld/Common/Memory.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/SetVector.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/Object/ELFTypes.h"
++#include "llvm/Support/JSON.h"
++
++// needed for the syscall numbers
++#include <sys/syscall.h>
++
++#include <regex>
++
++using namespace llvm;
++using namespace llvm::object;
++
++using namespace lld;
++using namespace lld::elf;
++
++const std::string TYPE_SYSCALL = "syscall";
++const std::string TYPE_SYSCALL_SYSCALL = "syscall_syscall";
++const std::string TYPE_SYSCALL_SYSCALL_CP = "syscall_syscall_cp";
++const std::string TYPE_CALLTARGET = "calltarget";
++const std::string TYPE_INDIRECT_CALLTARGET = "indirect_calltarget";
++
++std::map<std::string, std::map<std::string, int>> setxid_mapping;
++
++CallGraph GlobalCallGraph;
++
++// namespace {
++struct MappingInfo {
++  bool weak;
++  InputFile *file;
++  std::string name;
++  std::string type;
++  std::vector<std::string> callTargets;
++  std::vector<std::string> indirectCallTypes;
++  std::vector<std::string> referencedFunctions;
++  std::vector<int> syscallNumbers;
++  std::vector<std::string> alias;
++  std::vector<std::string> argumentReferences;
++  CallGraph callGraph;
++
++  MappingInfo() = default;
++  MappingInfo(std::string name, bool weak)
++      : weak(weak), file(nullptr), name(name) {}
++
++  void merge_vectors(std::vector<std::string> &lhs,
++                     const std::vector<std::string> &rhs) {
++    lhs.insert(std::end(lhs), std::begin(rhs), std::end(rhs));
++    std::sort(std::begin(lhs), std::end(lhs));
++    lhs.erase(std::unique(std::begin(lhs), std::end(lhs)), std::end(lhs));
++  }
++
++  void merge_vectors(std::vector<int> &lhs, const std::vector<int> &rhs) {
++    lhs.insert(std::end(lhs), std::begin(rhs), std::end(rhs));
++    std::sort(std::begin(lhs), std::end(lhs));
++    lhs.erase(std::unique(std::begin(lhs), std::end(lhs)), std::end(lhs));
++  }
++
++  void merge_into(const MappingInfo &rhs) {
++    if (type == "") {
++      type = rhs.type;
++      file = rhs.file;
++    }
++
++    merge_vectors(callTargets, rhs.callTargets);
++    merge_vectors(indirectCallTypes, rhs.indirectCallTypes);
++    merge_vectors(referencedFunctions, rhs.referencedFunctions);
++    merge_vectors(syscallNumbers, rhs.syscallNumbers);
++    merge_vectors(alias, rhs.alias);
++    merge_vectors(argumentReferences, rhs.argumentReferences);
++
++    GlobalCallGraph.merge_into(rhs.callGraph);
++  }
++
++  bool is_interesting() const {
++    return type != "" && (callTargets.size() || indirectCallTypes.size() ||
++                          referencedFunctions.size() || syscallNumbers.size());
++  }
++};
++
++bool is_live(Symbol *sym) {
++  auto *d = dyn_cast<Defined>(sym);
++  if (d && d->section && d->section->repl)
++    return d->section->repl->isLive();
++  return true;
++}
++
++// FIXME This code poorly reinvents the wheel in terms of
++// name/symbol resolution and should be replaced with the proper linker logic.
++class FunctionMapping {
++  class FileSymbolTable {
++    DenseMap<StringRef, Symbol *> table;
++
++  public:
++    void parse_file(InputFile *file) {
++      for (Symbol *sym : file->getSymbols())
++        if (sym->isFunc())
++          table[sym->getName()] = sym;
++    }
++
++    Symbol *operator[](StringRef name) {
++      auto it = table.find(name);
++      if (it != table.end())
++        return it->second;
++      return nullptr;
++    }
++  };
++
++  std::vector<MappingInfo> functions;
++  DenseMap<InputFile *, FileSymbolTable> symbolTables;
++  DenseMap<StringRef, size_t> globalMapping;
++  DenseMap<InputFile *, DenseMap<StringRef, size_t>> localMapping;
++  DenseSet<size_t> address_taken;
++  std::map<std::string, std::set<int>> assemblySyscalls;
++  std::map<std::string, std::map<std::string, std::set<int>>> syscall_offsets;
++  // here we map for each function the syscalls it issues but where we don't know the offset of the syscall instruction
++  std::map<std::string, std::vector<int>> syscalls_to_unknown_offsets;
++  // here we map for each function the offsets at which syscall instructions occur but we don't know the corresponding syscall numbers
++  std::map<std::string, std::vector<int>> unknown_syscalls_per_offset;
++  SyscallCallGraph syscallCallGraph;
++
++public:
++  std::vector<MappingInfo> &getFunctions() { return functions; }
++  const std::vector<MappingInfo> &getFunctions() const { return functions; }
++
++  std::map<std::string, std::set<int>> &getAssemblySyscalls() {
++    return assemblySyscalls;
++  }
++  const std::map<std::string, std::set<int>> &getAssemblySyscalls() const {
++    return assemblySyscalls;
++  }
++  const std::map<std::string, std::map<std::string, std::set<int>>> &getSyscallOffsets() const {
++    return syscall_offsets;
++  }
++  const std::map<std::string, std::vector<int>> &getSyscallsToUnknownOffsets() const {
++    return syscalls_to_unknown_offsets;
++  }
++  const std::map<std::string, std::vector<int>> &getUnkownSyscallsToKnownOffsets() const {
++    return unknown_syscalls_per_offset;
++  }
++
++
++  // We obtained all the information that we need, now we can start combining the information
++  // on musls own syscall functions in case they were not inlined.
++  // We map all syscalls from __syscall_cp where we don't know the syscall instruction offset to the offset of both __syscall_cp_c
++  // and sccp. The reason for that is that the former is a weak_alias of the later and we don't want to deal with finding out which one is used.
++  // We also merge all syscall numbers invoked via a call to the syscall() function to the offset of the instruction in the function itself.
++  // This is necessary in case an application directly issues a syscall using this function as it doesn't get inlined with static linkage.
++  void mergeMuslSyscallFunctions() {
++    auto __syscall_cp_c_offset = unknown_syscalls_per_offset.find("__syscall_cp_c");
++    auto __syscall_cp_asm_offset = unknown_syscalls_per_offset.find("__syscall_cp_asm");
++    auto sccp_offset = unknown_syscalls_per_offset.find("sccp");
++    auto syscall_offset = unknown_syscalls_per_offset.find("syscall");
++
++    auto __syscall_cp_c_syscalls = syscalls_to_unknown_offsets.find("__syscall_cp_c");
++    auto __syscall_cp_syscalls = syscalls_to_unknown_offsets.find("__syscall_cp");
++    auto sccp_syscalls = syscalls_to_unknown_offsets.find("sccp");
++    auto syscall_syscalls = syscalls_to_unknown_offsets.find("syscall");
++
++    // first we map all syscall_cp_c syscalls to the syscall instruction offset in the function itself
++    // note: this shouldn't even be necessary, __syscall_cp_c should never be invoked directly but through _syscall_cp
++    if (__syscall_cp_c_syscalls != syscalls_to_unknown_offsets.end() && __syscall_cp_c_offset != unknown_syscalls_per_offset.end()) {
++      if (__syscall_cp_c_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : __syscall_cp_c_syscalls->second)
++          syscall_offsets["__syscall_cp_c"][std::to_string(syscall)].insert(__syscall_cp_c_offset->second.front());
++      }
++    }
++
++    // next, we map all syscall_cp_c syscalls to syscall instruction offset in sccp, but store it in _syscall_cp_c due to the weak alias on sccp
++    if (__syscall_cp_c_syscalls != syscalls_to_unknown_offsets.end() && sccp_offset != unknown_syscalls_per_offset.end()) {
++      if (sccp_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : __syscall_cp_c_syscalls->second)
++          syscall_offsets["sccp"][std::to_string(syscall)].insert(sccp_offset->second.front());
++      }
++    }
++
++    // now we repeat the above two steps but for syscall_cp syscall numbers instead of syscall_cp_c
++    if (__syscall_cp_syscalls != syscalls_to_unknown_offsets.end() && __syscall_cp_c_offset != unknown_syscalls_per_offset.end()) {
++      if (__syscall_cp_c_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : __syscall_cp_syscalls->second)
++          syscall_offsets["__syscall_cp_c"][std::to_string(syscall)].insert(__syscall_cp_c_offset->second.front());
++      }
++    }
++
++    // next, we map all syscall_cp_c syscalls to syscall instruction offset in sccp, but store it in _syscall_cp_c due to the weak alias on sccp
++    if (__syscall_cp_syscalls != syscalls_to_unknown_offsets.end() && sccp_offset != unknown_syscalls_per_offset.end()) {
++      if (sccp_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : __syscall_cp_syscalls->second)
++          syscall_offsets["__syscall_cp_c"][std::to_string(syscall)].insert(sccp_offset->second.front());
++      }
++    }
++
++    // here we map sccp syscall numbers to the offset in the sccp function
++    // note: this should never happen, the function should only be invoked via the _syscall_cp trampoline
++    if (sccp_syscalls != syscalls_to_unknown_offsets.end() && sccp_offset != unknown_syscalls_per_offset.end()) {
++      if (sccp_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : sccp_syscalls->second)
++          syscall_offsets["sccp"][std::to_string(syscall)].insert(sccp_offset->second.front());
++      }
++    }
++
++    // now, we map syscall() syscall numbers to the offset in the syscall() function
++    if (syscall_syscalls != syscalls_to_unknown_offsets.end() && syscall_offset != unknown_syscalls_per_offset.end()) {
++      if (syscall_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : syscall_syscalls->second)
++          syscall_offsets["syscall"][std::to_string(syscall)].insert(syscall_offset->second.front());
++      }
++    }
++
++    // finally, we map syscall_cp syscall numbers to the __syscall_cp_asm offset. This is only necessary if pthread are linked and used (pthread_cancel)
++    if (__syscall_cp_syscalls != syscalls_to_unknown_offsets.end() && __syscall_cp_asm_offset != unknown_syscalls_per_offset.end()) {
++      if (__syscall_cp_asm_offset->second.size() != 1)
++        llvm::errs() << "something went wrong, there is only supposed to be one syscall instruction in that function\n";
++      else {
++        for (auto syscall : __syscall_cp_syscalls->second)
++          syscall_offsets["__syscall_cp_asm"][std::to_string(syscall)].insert(__syscall_cp_asm_offset->second.front());
++      }
++    }
++
++    // we have merged all the info we need for them, so we remove
++    unknown_syscalls_per_offset.erase("__syscall_cp_c");
++    unknown_syscalls_per_offset.erase("sccp");
++    unknown_syscalls_per_offset.erase("syscall");
++    unknown_syscalls_per_offset.erase("__syscall_cp_asm");
++    syscalls_to_unknown_offsets.erase("__syscall_cp_c");
++    syscalls_to_unknown_offsets.erase("__syscall_cp");
++    syscalls_to_unknown_offsets.erase("sccp");
++    syscalls_to_unknown_offsets.erase("syscall");
++  }
++
++  void addSyscallOffsets(std::map<std::string, std::map<std::string, std::set<int>>> offsets) {
++    syscall_offsets.insert(offsets.begin(), offsets.end());
++  }
++
++  void addSyscallsToUnkownOffsets(std::map<std::string, std::vector<int>> info) {
++    for (auto func : info) {
++      syscalls_to_unknown_offsets[func.first].insert(syscalls_to_unknown_offsets[func.first].end(), func.second.begin(), func.second.end());
++    }
++  }
++
++  void addUnkownSyscallsPerOffset(std::map<std::string, std::vector<int>> info) {
++    for (auto func : info) {
++      unknown_syscalls_per_offset[func.first].insert(unknown_syscalls_per_offset[func.first].end(), func.second.begin(), func.second.end());
++    }
++  }
++
++  void addAssemblySyscall(std::string label, int syscall) {
++    assemblySyscalls[label].insert(syscall);
++  }
++
++  const SyscallCallGraph &getSyscallCallGraph() const {
++    return syscallCallGraph;
++  }
++
++  bool addSyscallTransition(int From, int To) {
++    return syscallCallGraph.Transitions[From].insert(To).second;
++  }
++
++  void addOffsetInformation(std::pair<const std::string, std::map<std::string, std::set<int>>> &per_syscall_offsets) {
++    syscallCallGraph.Offsets[per_syscall_offsets.first].insert(per_syscall_offsets.second.begin(), per_syscall_offsets.second.end());
++  }
++
++  void addUnknownSyscallKnownOffsetInformation(const std::string &function, std::set<int> offset) {
++    syscallCallGraph.unknown_syscalls[function].insert(offset.begin(), offset.end());
++  }
++
++  MappingInfo *find_local(InputFile *scope, StringRef name) {
++    auto scopeIt = localMapping.find(scope);
++    if (scopeIt != localMapping.end()) {
++      auto localIt = scopeIt->second.find(name);
++      if (localIt != scopeIt->second.end())
++        return &(functions[localIt->second]);
++    }
++    return nullptr;
++  }
++
++  MappingInfo *find_global(StringRef name) {
++    auto globalIt = globalMapping.find(name);
++    if (globalIt != globalMapping.end())
++      return &(functions[globalIt->second]);
++    return nullptr;
++  }
++
++  MappingInfo *find(InputFile *scope, StringRef name) {
++    MappingInfo *res = find_local(scope, name);
++    if (res)
++      return res;
++    return find_global(name);
++  }
++
++  // Insert stubs into the correct lookup tables according to the binding type
++  // of the processed symbol.
++  void create_mappings(InputFile *file) {
++    // Ensure that a symbol table for the input file exists.
++    auto it = symbolTables.find(file);
++    if (it == symbolTables.end())
++      symbolTables[file].parse_file(file);
++
++    // Create or update the needed MappingInfo entries for each symbol.
++    // Local symbols are placed into the local mapping table while all other
++    // symbols will be placed in the global table.
++    for (Symbol *sym : file->getSymbols()) {
++      if (!sym->isFunc() || !is_live(sym))
++        continue;
++
++      if (sym->isLocal()) {
++        MappingInfo *res = find_local(file, sym->getName());
++        if (res)
++          continue;
++        localMapping[file][sym->getName()] = functions.size();
++        functions.emplace_back(sym->getName(), false);
++        continue;
++      }
++
++      MappingInfo *res = find_global(sym->getName());
++      if (res) {
++        if (res->weak && !sym->isWeak())
++          res->weak = false;
++        continue;
++      }
++      globalMapping[sym->getName()] = functions.size();
++      functions.emplace_back(sym->getName(), sym->isWeak());
++    }
++  }
++
++  void add_function(InputFile *scope, const MappingInfo &func) {
++    MappingInfo *info = find(scope, func.name);
++    Symbol *sym = symbolTables[scope][func.name];
++
++    // In most of the cases we have a the symbol in the same file as the
++    // mapping info. However, when, for example, assembler routines are
++    // manually annotated in a different TU then no sym is found in our
++    // simplistic symbol lookup. The following hack permits to apply such
++    // annotations by making them global strong annotations until a more
++    // correct implementation is available.
++    bool local = false;
++    bool weak = false;
++    if (sym) {
++      local = sym->isLocal();
++      weak = sym->isWeak();
++    }
++
++    // Drop functions that have not been mapped.
++    if (!info)
++      return;
++
++    // Local symbols can and should always be merged.
++    if (local) {
++      info->merge_into(func);
++      for (auto &&name : info->referencedFunctions)
++        add_address_taken(scope, name);
++      info->referencedFunctions.clear();
++      return;
++    }
++
++    // Weak functions can be dropped when also a strong symbol exists.
++    if (weak && !info->weak)
++      return;
++    info->merge_into(func);
++    for (auto &&name : info->referencedFunctions)
++      add_address_taken(scope, name);
++    info->referencedFunctions.clear();
++  }
++
++  void add_address_taken(InputFile *scope, StringRef name) {
++    MappingInfo *info = find(scope, name);
++    if (info)
++      address_taken.insert(std::distance(&functions.front(), info));
++  }
++
++  bool has_address_taken(const MappingInfo *func) const {
++    auto idx = std::distance(&functions.front(), func);
++    auto it = address_taken.find(idx);
++    return it != address_taken.end();
++  }
++};
++
++struct MappingInfoRoot {
++  std::vector<MappingInfo> functions;
++  std::vector<std::string> addresses_taken;
++};
++
++// Implements Tarjan's strongly connected components algorithm.
++template <typename T> class SccAnalysis {
++public:
++  struct SccNodeObj;
++
++  using IndexType = uint64_t;
++  using EdgeType = std::pair<T *, T *>;
++  using EdgesType = std::vector<EdgeType>;
++  using SccVecType = std::vector<SccNodeObj>;
++
++  SccVecType sCCs; // FIXME make this private and expose iterators
++
++  struct NodeObj {
++    T *ptr = nullptr;
++    SccNodeObj *scc = nullptr;
++    IndexType dfsIndex = 0;
++    std::set<NodeObj *> edgeTargets;
++  };
++
++  struct SccNodeObj {
++    std::set<NodeObj *> nodes;
++    std::set<SccNodeObj *> edgeTargets;
++  };
++
++protected:
++  std::map<T *, std::unique_ptr<NodeObj>> nodes;
++  std::vector<NodeObj *> stack;
++  IndexType nextDfsIndex = 1;
++
++  NodeObj *getOrCreateNode(T *ptr) {
++    auto it = nodes.find(ptr);
++    if (it != nodes.end())
++      return (*it).second.get();
++    auto objPtr = std::make_unique<NodeObj>();
++    objPtr->ptr = ptr;
++    NodeObj *res = objPtr.get();
++    nodes[ptr] = std::move(objPtr);
++    return res;
++  }
++
++  IndexType strongConnect(NodeObj *node) {
++    node->dfsIndex = nextDfsIndex;
++    IndexType lowLink = nextDfsIndex;
++    ++nextDfsIndex;
++    stack.push_back(node);
++
++    for (NodeObj *target : node->edgeTargets) {
++      if (target->dfsIndex == 0) {
++        auto targetLowLink = strongConnect(target);
++        lowLink = std::min(lowLink, targetLowLink);
++      } else if (std::end(stack) !=
++                 std::find(std::begin(stack), std::end(stack), target)) {
++        lowLink = std::min(lowLink, target->dfsIndex);
++      }
++    }
++
++    if (lowLink == node->dfsIndex) {
++      // Create a new SCC with all the elements that are below the current
++      // node on the stack.
++      sCCs.resize(sCCs.size() + 1);
++      SccNodeObj &scc = sCCs.back();
++      NodeObj *element;
++      do {
++        element = stack.back();
++        stack.pop_back();
++        element->scc = &scc;
++        scc.nodes.insert(element);
++        // Determine the edges between SCCs (generates a DAG).
++        for (NodeObj *target : element->edgeTargets)
++          if (target->scc != nullptr && target->scc != element->scc)
++            scc.edgeTargets.insert(target->scc);
++      } while (element != node);
++    }
++    return lowLink;
++  }
++
++public:
++  SccAnalysis(const EdgesType &edgeVector) {
++
++    // Determine which nodes are in the graph based on the edges.
++    for (auto &&edge : edgeVector) {
++      NodeObj *first = getOrCreateNode(edge.first);
++      NodeObj *second = getOrCreateNode(edge.second);
++      first->edgeTargets.insert(second);
++    }
++
++    sCCs.reserve(nodes.size());
++    for (auto &&nodePair : nodes) {
++      NodeObj *node = nodePair.second.get();
++      if (node->dfsIndex == 0)
++        strongConnect(node);
++    }
++  }
++  ~SccAnalysis(){};
++};
++
++// } // namespace
++
++namespace llvm {
++namespace json {
++
++bool fromJSON(const Value &e, AssemblySyscall &syscall) {
++  ObjectMapper o(e);
++  if (!o || !o.map("syscall", syscall.Syscall))
++    return false;
++  
++  o.map("label", syscall.Label);
++  o.map("line", syscall.Line);
++  return true;
++}
++
++bool fromJSON(const Value &e, AssemblyCallGraph &graph) {
++  ObjectMapper o(e);
++  std::map<std::string, std::vector<AssemblySyscall>> Syscalls;
++  if (!o || !o.map("syscalls", Syscalls))
++    return false;
++  
++  graph.addSyscallInformation(Syscalls);
++  
++  std::map<std::string, std::vector<std::string>> Transitions;
++  if(!o.map("transitions", Transitions))
++    return false;
++  
++  graph.addTransitionInformation(Transitions);
++  
++  o.map("functions", graph.Functions);
++  return true;
++}
++
++bool fromJSON(const Value &e, MappingInfoRoot &info) {
++  ObjectMapper o(e);
++  if (!o || !o.map("functions", info.functions))
++    return false;
++  
++  o.map("addresses_taken", info.addresses_taken);
++  return true;
++}
++
++bool fromJSON(const Value &e, CallGraph &graph) {
++  ObjectMapper o(e);
++  
++  std::map<std::string, std::vector<CallGraphCall>> Calls;
++  if (!o || !o.map("calls", Calls))
++    return false;
++  
++  graph.addCallInformation(Calls);
++  
++  std::map<std::string, std::vector<std::string>> Transitions;
++  if (!o.map("transitions", Transitions))
++    return false;
++  
++  graph.addTransitionInformation(Transitions);
++  
++  std::string Start;
++  if (!o.map("start", Start))
++    return false;
++  
++  graph.Starts.insert(Start);
++  
++  std::string End;
++  if (!o.map("end", End))
++    return false;
++  
++  graph.Ends.insert(End);
++  
++  return true;
++}
++
++bool fromJSON(const Value &e, CallGraphCall &call) {
++  ObjectMapper o(e);
++  if (!o || !o.map("content", call.Content))
++    return false;
++  
++  if (!o.map("line", call.Line))
++    return false;
++  
++  if (!o.map("type", call.Type))
++    return false;
++
++  return true;
++}
++
++bool fromJSON(const Value &e, MappingInfo &info) {
++  ObjectMapper o(e);
++  if (!o || !o.map("name", info.name) || !o.map("type", info.type))
++    return false;
++
++  o.map("call_targets", info.callTargets);
++  o.map("indirect_call_types", info.indirectCallTypes);
++  o.map("referenced_functions", info.referencedFunctions);
++  o.map("syscall_numbers", info.syscallNumbers);
++  o.map("alias", info.alias);
++  o.map("argument_references", info.argumentReferences);
++  o.map("call_graph", info.callGraph);
++  return true;
++}
++
++Value toJSON(const MappingInfo &info) {
++  Object res{{"name", info.name}, {"type", info.type}};
++  if (info.callTargets.size())
++    res["call_targets"] = info.callTargets;
++  if (info.indirectCallTypes.size())
++    res["indirect_call_types"] = info.indirectCallTypes;
++  if (info.referencedFunctions.size())
++    res["referenced_functions"] = info.referencedFunctions;
++  if (info.alias.size())
++    res["alias"] = info.alias;
++  if (info.argumentReferences.size())
++    res["argument_references"] = info.argumentReferences;
++  if (info.syscallNumbers.size())
++    res["syscall_numbers"] = info.syscallNumbers;
++  return res;
++}
++
++Value toJSON(const FunctionMapping &mapping) {
++  Array functions, addresses;
++  for (const MappingInfo &info : mapping.getFunctions()) {
++    // if (info.is_interesting())
++    functions.push_back(toJSON(info));
++    if (mapping.has_address_taken(&info))
++      addresses.push_back(info.name);
++  }
++  return Object{{"addresses_taken", std::move(addresses)},
++                {"functions", std::move(functions)}};
++}
++
++Value toJSON(const SyscallCallGraph& syscallCallGraph) {
++  Object callGraph;
++  for (const auto& fromSyscall : syscallCallGraph.Transitions) {
++    Array transitions;
++    for (int toSyscall : fromSyscall.second) {
++      transitions.push_back(toSyscall);
++    }
++    callGraph[std::to_string(fromSyscall.first)] = std::move(transitions);
++  }
++
++  Object FunctionOffsets;
++  for (const auto func : syscallCallGraph.Offsets) {
++    Object syscalls;
++    for (auto per_syscall_offset : func.second) {
++      Array offsets;
++      for (auto offset : per_syscall_offset.second)
++        offsets.push_back(offset);
++      syscalls[per_syscall_offset.first] = std::move(offsets);
++    }
++    FunctionOffsets[func.first] = std::move(syscalls);
++  }
++
++  Object Wildcards;
++  for (const auto func : syscallCallGraph.unknown_syscalls) {
++    Object syscalls; // this is simply done out of convenience so that we don't have to update the parsign in our support library
++    Array offsets;
++    for (const auto offset : func.second) {
++      offsets.push_back(offset);
++    }
++    syscalls["-1"] = std::move(offsets);
++    Wildcards[func.first] = std::move(syscalls);
++  }
++
++  Object syscall_locations = Object{{"offsets", std::move(FunctionOffsets)},
++                                    {"wildcards", std::move(Wildcards)}};
++
++  return Object{
++    {"callgraph", std::move(callGraph)},
++    {"sysloc", std::move(syscall_locations)}
++    };
++}
++
++} // namespace json
++} // namespace llvm
++
++void mergeAssemblySyscalls(FunctionMapping &mapping) {
++  for (MappingInfo &info : mapping.getFunctions()) {
++    const auto it = mapping.getAssemblySyscalls().find(info.name);
++    
++    if (it == mapping.getAssemblySyscalls().end())
++      continue;
++    
++    for (int syscall : it->second) {
++      info.type = "assembly";
++      info.syscallNumbers.push_back(syscall);
++    }
++  }
++}
++
++/// Propagate the callhierarchy information along the direct call edges.
++///
++/// After this propagation step all direct call relationships should be
++/// resolved and every MappingInfo entry carries the accumulated information
++/// of directly callable functions.
++void propagateDirectCalls(FunctionMapping &mapping) {
++  bool verbose = errorHandler().verbose;
++  // Extract the call graph from the call edges, determine the strongly coupled
++  // components (SCCs) to transform it into a directed acyclic graph (DAG), and
++  // make the SCC DAG iterable in post-order.
++  SccAnalysis<MappingInfo>::EdgesType callEdges;
++  for (MappingInfo &info : mapping.getFunctions()) {
++    for (auto It = info.callTargets.begin(); It != info.callTargets.end();) {
++      MappingInfo *target = mapping.find(info.file, *It);
++      if (!target) {
++        if (verbose)
++          lld::errs() << "[WARN] " << info.file->getName() << ": " << info.name
++                      << ": no mapping found for targetName = " << *It << "\n";
++        It = info.callTargets.erase(It);
++        continue;
++      }
++      if (target->type == "") {
++        if (verbose)
++          lld::errs() << "[WARN] " << info.file->getName() << ": " << info.name
++                      << ": targetName = " << *It << " is incomplete \n";
++        It = info.callTargets.erase(It);
++        continue;
++      }
++
++      // drop uninteresting mappings immediately to speedup SCC construction
++      if (!target->is_interesting()) {
++        It = info.callTargets.erase(It);
++        continue;
++      }
++      callEdges.push_back(SccAnalysis<MappingInfo>::EdgeType{&info, target});
++      ++It;
++    }
++  }
++  SccAnalysis<MappingInfo> analysis(callEdges);
++
++  // Flatten the call graph by updating the MappingInfo.
++  std::vector<MappingInfo> sccInfos;
++  sccInfos.resize(analysis.sCCs.size());
++  for (SccAnalysis<MappingInfo>::SccNodeObj &scc : analysis.sCCs) {
++    size_t sccIndex =
++        std::distance(std::begin(analysis.sCCs),
++                      SccAnalysis<MappingInfo>::SccVecType::iterator(&scc));
++    MappingInfo &sccInfo = sccInfos[sccIndex];
++
++    // Accumulate the mapping info within the SCC.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes) {
++      sccInfo.merge_into(*node->ptr);
++    }
++
++    // Remove the calls between nodes within the SCC.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes) {
++      sccInfo.callTargets.erase(std::remove(std::begin(sccInfo.callTargets),
++                                            std::end(sccInfo.callTargets),
++                                            node->ptr->name),
++                                std::end(sccInfo.callTargets));
++    }
++
++    // Update the Info for each SCC.
++    for (SccAnalysis<MappingInfo>::SccNodeObj *targetScc : scc.edgeTargets) {
++      for (SccAnalysis<MappingInfo>::NodeObj *targetNode : targetScc->nodes)
++        sccInfo.callTargets.erase(std::remove(std::begin(sccInfo.callTargets),
++                                              std::end(sccInfo.callTargets),
++                                              targetNode->ptr->name),
++                                  std::end(sccInfo.callTargets));
++
++      size_t targetSccIndex = std::distance(
++          std::begin(analysis.sCCs),
++          SccAnalysis<MappingInfo>::SccVecType::iterator(targetScc));
++      assert(targetSccIndex < SccIndex);
++      sccInfo.merge_into(sccInfos[targetSccIndex]);
++    }
++
++    // Backpropagate the SCC info into its nodes.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes) {
++      node->ptr->callTargets = sccInfo.callTargets;
++      node->ptr->indirectCallTypes = sccInfo.indirectCallTypes;
++      node->ptr->referencedFunctions = sccInfo.referencedFunctions;
++      node->ptr->syscallNumbers = sccInfo.syscallNumbers;
++    }
++  }
++}
++
++void propagateIndirectCalls(FunctionMapping &mapping) {
++  // bool verbose = errorHandler().verbose;
++
++  // Build a mapping from types to indirect callable functions.
++  DenseMap<StringRef, DenseSet<MappingInfo *>> indCallable;
++  for (MappingInfo &func : mapping.getFunctions())
++    if (mapping.has_address_taken(&func))
++      indCallable[func.type].insert(&func);
++
++  // Extract the call graph from the call edges, determine the strongly
++  // coupled components (SCCs) to transform it into a directed acyclic graph
++  // (DAG), and make the SCC DAG iterable in post-order.
++  SccAnalysis<MappingInfo>::EdgesType callEdges;
++  for (MappingInfo &info : mapping.getFunctions()) {
++    for (auto &&calltype : info.indirectCallTypes) {
++      auto it = indCallable.find(calltype);
++      if (it == indCallable.end()) {
++        // if (verbose)
++        //   lld::errs() << "[WARN] " << info.name
++        //               << ": Indirect call to unknown function signature: "
++        //               << calltype << "\n";
++        continue;
++      }
++      for (auto &&target : it->second)
++        if (target->is_interesting())
++          callEdges.push_back(
++              SccAnalysis<MappingInfo>::EdgeType{&info, target});
++    }
++  }
++  SccAnalysis<MappingInfo> analysis(callEdges);
++
++  // Flatten the call graph by updating the MappingInfo.
++  std::vector<MappingInfo> sccInfos;
++  sccInfos.resize(analysis.sCCs.size());
++  for (SccAnalysis<MappingInfo>::SccNodeObj &scc : analysis.sCCs) {
++    size_t sccIndex =
++        std::distance(std::begin(analysis.sCCs),
++                      SccAnalysis<MappingInfo>::SccVecType::iterator(&scc));
++    MappingInfo &sccInfo = sccInfos[sccIndex];
++
++    // Accumulate the mapping info within the SCC.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes)
++      sccInfo.merge_into(*node->ptr);
++
++    // Remove the calls between nodes within the SCC.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes) {
++      sccInfo.indirectCallTypes.erase(
++          std::remove(std::begin(sccInfo.indirectCallTypes),
++                      std::end(sccInfo.indirectCallTypes), node->ptr->type),
++          std::end(sccInfo.indirectCallTypes));
++    }
++
++    // Update the Info for each SCC.
++    for (SccAnalysis<MappingInfo>::SccNodeObj *targetScc : scc.edgeTargets) {
++      for (SccAnalysis<MappingInfo>::NodeObj *targetNode : targetScc->nodes)
++        sccInfo.indirectCallTypes.erase(
++            std::remove(std::begin(sccInfo.indirectCallTypes),
++                        std::end(sccInfo.indirectCallTypes),
++                        targetNode->ptr->type),
++            std::end(sccInfo.indirectCallTypes));
++
++      size_t targetSccIndex = std::distance(
++          std::begin(analysis.sCCs),
++          SccAnalysis<MappingInfo>::SccVecType::iterator(targetScc));
++      assert(TargetSccIndex < SccIndex);
++      sccInfo.merge_into(sccInfos[targetSccIndex]);
++    }
++
++    // Backpropagate the SCC info into its nodes.
++    for (SccAnalysis<MappingInfo>::NodeObj *node : scc.nodes) {
++      node->ptr->callTargets = sccInfo.callTargets;
++      node->ptr->indirectCallTypes = sccInfo.indirectCallTypes;
++      node->ptr->referencedFunctions = sccInfo.referencedFunctions;
++      node->ptr->syscallNumbers = sccInfo.syscallNumbers;
++    }
++  }
++}
++
++/// Extract all needed syscall numbers for embedding in the final executable.
++///
++/// We only use syscalls from functions that can be reached from main and
++/// exit. exit is required as this is the function that terminates the program
++/// but is not reachable from main as it is not directly called from it.
++std::set<unsigned> extractSyscalls(FunctionMapping &mapping) {
++  std::set<unsigned> syscalls;
++
++  MappingInfo *main = mapping.find_global("main");
++  if (main)
++    syscalls.insert(main->syscallNumbers.begin(), main->syscallNumbers.end());
++
++  MappingInfo *exit = mapping.find_global("exit");
++  if (exit)
++    syscalls.insert(exit->syscallNumbers.begin(), exit->syscallNumbers.end());
++  return syscalls;
++}
++
++/// Extracts the mapping information out of the JSON Value found in the binary
++/// header and includes them in the function mapping
++void extractMappingInformation(json::Value Value, InputSectionBase *s,
++                               FunctionMapping &mapping) {
++  MappingInfoRoot root;
++  if (!json::fromJSON(Value, root)) {
++    warn("Mapping the callhierarchy information failed.");
++    return;
++  }
++  // Insert the parsed information into the mapping object.
++  for (auto &&entry : root.functions) {
++    entry.file = s->file;
++    mapping.add_function(s->file, entry);
++  }
++  for (auto &&name : root.addresses_taken)
++    mapping.add_address_taken(s->file, name);
++}
++
++/// Gets all syscalls called from assembly together with their label and
++/// callgraph information and includes them in the function mapping
++void extractAssemblySyscalls(json::Value Value, FunctionMapping &mapping) {
++  AssemblyCallGraph graph;
++  if (!json::fromJSON(Value, graph)) {
++    warn("Mapping the assembly callgraph information failed.");
++    return;
++  }
++  
++  AssemblyCallGraph::AssemblyCallGraphs.push_back(graph);
++  
++  for (const auto& Entry : graph.Syscalls) {
++    for (const auto& Syscall : Entry.second) {
++      mapping.addAssemblySyscall(Syscall.Label, Syscall.Syscall);
++    }
++  }
++}
++
++/// Extracts the syscall offsets out of the JSON Value found in the binary
++/// header and includes them in the function mapping
++void extractSyscallOffsets(json::Value Value, InputSectionBase *s,
++                               FunctionMapping &mapping) {
++  json::ObjectMapper o(Value);
++  // we use it here with a vector, but later on convert it to a set as we need each offset only once
++  std::map<std::string, std::map<std::string, std::vector<int>>> _offsets;
++  std::map<std::string, std::vector<int>> syscalls_to_unknown_offsets;
++  std::map<std::string, std::vector<int>> unknown_syscalls_per_offset;
++  if (!o || !o.map("functions", _offsets)) {
++    warn("Mapping the syscall offsets failed.");
++    return;
++  }
++
++  if (!o || !o.map("syscalls_to_unknown_offsets", syscalls_to_unknown_offsets)) {
++    warn("Mapping the known syscalls to unkown offsets failed.");
++    return;
++  }
++
++  if (!o || !o.map("unknown_syscalls_per_offset", unknown_syscalls_per_offset)) {
++    warn("Mapping the unknown syscalls to known offsets failed.");
++    return;
++  }
++
++  // at this point, we have all the information available that we need
++  // we know for most syscalls where they can occur
++  // we know the offset of the syscall instruction in non-inlined syscall functions
++  // we know about syscall instructions where we don't know the syscall number (in musl, this is only the case for 2 syscalls).
++  // time to store all this information so that we can later on use it
++  std::map<std::string, std::map<std::string, std::set<int>>> offsets;
++  for(auto func : _offsets) {
++    for(auto syscall : func.second) {
++      for (auto offset : syscall.second)
++        offsets[func.first][syscall.first].insert(offset);
++    }
++  }
++
++  mapping.addSyscallOffsets(offsets);
++  mapping.addSyscallsToUnkownOffsets(syscalls_to_unknown_offsets);
++  mapping.addUnkownSyscallsPerOffset(unknown_syscalls_per_offset);
++}
++
++template <class ELFT> void elf::combineCallHierarchyInfo() {
++  FunctionMapping mapping;
++
++  for (InputFile *file : objectFiles) {
++    mapping.create_mappings(file);
++    // TODO: automate this process, should be easily doable but no time for that
++    std::string filename = file->getName();
++    if (filename == "setegid.lo")
++      setxid_mapping["do_setxid"]["setegid"] = SYS_setresgid;
++    if (filename == "seteuid.lo")
++      setxid_mapping["do_setxid"]["seteuid"] = SYS_setresuid;
++    if (filename == "setgid.lo")
++      setxid_mapping["do_setxid"]["setgid"] = SYS_setgid;
++    if (filename == "setregid.lo")
++      setxid_mapping["do_setxid"]["setregid"] = SYS_setregid;
++    if (filename == "setresgid.lo")
++      setxid_mapping["do_setxid"]["setresgid"] = SYS_setresgid;
++    if (filename == "setresuid.lo")
++      setxid_mapping["do_setxid"]["setresuid"] = SYS_setresuid;
++    if (filename == "setreuid.lo")
++      setxid_mapping["do_setxid"]["setreuid"] = SYS_setreuid;
++    if (filename == "setuid.lo")
++      setxid_mapping["do_setxid"]["setuid"] = SYS_setuid;
++  }
++
++  // Extract the MappingInfo from all .note.callhierarchy input sections.
++  for (InputSectionBase *s : inputSections) {
++    auto data = s->data();
++    
++    if (s->name.startswith(".note.callhierarchy")) {
++      llvm::Error err = Error::success();
++      auto i = typename ELFT::NoteIterator(data.data(), data.size(), err);
++      auto e = typename ELFT::NoteIterator();
++      s->markDead();
++  
++      for (; i != e; ++i) {
++        if (err) {
++          warn("Iterating ELF notes failed!");
++          break;
++        }
++        typename ELFT::Note note = *i;
++        if (note.getName() != "SFIP" || note.getType() != 0x400) {
++          s->markLive();
++          continue;
++        }
++    
++        // Just scan the sections and discard them if they only contain the SFIP
++        // callhierachy information.
++        if (!config->embedCallhierarchy)
++          continue;
++    
++        // Parse the callhierarchy information and map the JSON values into
++        // MappingInfoRoot structures.
++        Expected<json::Value> value =
++            json::parse((const char *)note.getDesc().data());
++        if (!value) {
++          warn("Parsing the callhierarchy from the ELF note description "
++               "failed in " + s->file->getName() + "\n");
++          continue;
++        }
++        
++        extractMappingInformation(*value, s, mapping);
++      }
++    } else if (s->name.startswith(".assembly_syscalls")) {
++      s->markDead();
++      if (!config->embedCallhierarchy)
++        continue;
++
++      // somehow, the embedded data sometimes contains other stuff as well in the beginning and end
++      // hence, we encoded the data as pascal strings and extract it now using the extra information
++      std::string data = (const char *) s->data().data();
++
++      std::regex regex("\\{length:([0-9]*)\\}");
++      std::smatch sm;
++      int length = 0;
++      if (regex_search(data,sm,regex)){
++        if(sm.size() != 2) {
++          warn("Couldn't find length encoded assembly syscalls section in " + s->file->getName() + "\n");
++          continue;
++        }
++        std::stringstream intValue(sm[1]);
++        intValue >> length;
++      } else {
++        warn("Couldn't find length string in encoded assembly syscalls section in " + s->file->getName() + "\n");
++        continue;
++      }
++
++      size_t pos = data.find("{\"functions\":");
++      if(pos == std::string::npos) {
++        warn("Couldn't find encoded json string in encoded assembly syscalls section in " + s->file->getName() + "\n");
++        continue;
++      }
++      std::string corrected_data = data.substr(pos, length);
++
++      Expected<json::Value> value = json::parse((const char *)corrected_data.data());
++      if (!value) {
++        warn("Parsing the assembly call graph from the ELF note description "
++             "failed in " + s->file->getName() + "\n");
++        continue;
++      }
++
++      extractAssemblySyscalls(*value, mapping);
++    } else if (s->name.startswith(".syscall_offsets")) {
++      s->markDead();
++      if (!config->embedCallhierarchy)
++        continue;
++
++      // somehow, the embedded data sometimes contains other stuff as well in the beginning and end
++      // hence, we encoded the data as pascal strings and extract it now using the extra information
++      std::string data = (const char *) s->data().data();
++
++      std::regex regex("\\{length:([0-9]*)\\}");
++      std::smatch sm;
++      int length = 0;
++      if (regex_search(data,sm,regex)){
++        if(sm.size() != 2) {
++          warn("Couldn't find length encoded syscall offsets section in " + s->file->getName() + "\n");
++          continue;
++        }
++        std::stringstream intValue(sm[1]);
++        intValue >> length;
++      } else {
++        warn("Couldn't find length string in encoded syscall offsets section in " + s->file->getName() + "\n");
++        continue;
++      }
++
++      size_t pos = data.find("{\"functions\":");
++      if(pos == std::string::npos) {
++        warn("Couldn't find encoded json string in encoded syscall offsets section in " + s->file->getName() + "\n");
++        continue;
++      }
++      std::string corrected_data = data.substr(pos, length);
++
++      Expected<json::Value> value = json::parse((const char *)corrected_data.data());
++      if (!value) {
++        warn("Parsing the syscall offsets from the ELF note description failed in " + s->file->getName() + "\n");
++        continue;
++      }
++
++      extractSyscallOffsets(*value, s, mapping);
++    }
++  }
++
++  // Abort here and let the linker remove the note sections that have been
++  // marked as dead.
++  if (!config->embedCallhierarchy)
++    return;
++
++  // helper to format a string with syscall numbers
++  auto get_syscall_string = [](auto mapping) -> auto {
++    std::stringstream ss;
++    for (auto numbers : extractSyscalls(mapping))
++      ss << numbers << " ";
++    return ss.str();
++  };
++
++  // now we combine the musl syscall functions offsets with the syscall numbers that they are called with
++  mapping.mergeMuslSyscallFunctions();
++  mergeAssemblySyscalls(mapping);
++  propagateDirectCalls(mapping);
++  propagateIndirectCalls(mapping);
++
++  MappingInfo *main = mapping.find_global("main");
++  if (main) {
++    GlobalCallGraph.setFunctionMapping(&mapping);
++    GlobalCallGraph.mapInformation(mapping);
++    
++    // llvm::errs() << "digraph G {\n";
++    // llvm::errs() << "-1 [shape=Mdiamond];\n";
++    
++    CallGraphCall MainCall = {"main", 0, "calltarget"};
++    for (const auto& Start : GlobalCallGraph.getStartingBasicBlocks(MainCall)) {
++      GlobalCallGraph.visit(Start.first, "main");
++    }
++
++    // llvm::errs() << "}\n";
++  }
++
++  if (!config->isStatic) {
++    inputSections.push_back(
++        make<NoteSection>(".note.callhierarchy", 0x401, "SFIP",
++                          formatv("{0}", json::toJSON(mapping)).str()));
++  } else {
++    inputSections.push_back(make<NoteSection>(".note.syscalls", 0x402, "SFIP",
++                                              get_syscall_string(mapping)));
++  
++    const auto graphJSON = json::toJSON(mapping.getSyscallCallGraph());
++    const auto graphString = formatv("{0}", graphJSON).str();
++    
++    llvm::errs() << graphString << "\n";
++    
++    inputSections.push_back(make<NoteSection>(".note.state_filtering", 0x403,
++                                              "SFIP", graphString));
++  }
++}
++
++template void elf::combineCallHierarchyInfo<ELF32LE>();
++template void elf::combineCallHierarchyInfo<ELF32BE>();
++template void elf::combineCallHierarchyInfo<ELF64LE>();
++template void elf::combineCallHierarchyInfo<ELF64BE>();
++
++/// ---------------------------------------------------
++///
++/// Call graph code
++///
++/// ----------------------------------------------------
++
++/// Sets the current function mapping which should be used in the call graph
++///
++/// \param Mapping The FunctionMapping which should be used
++void CallGraph::setFunctionMapping(FunctionMapping *Mapping) {
++  this->Mapping = Mapping;
++}
++
++/// Adds additional basic block call information to this call graph
++///
++/// \param Calls The calls with their corresponding basic blocks
++void CallGraph::addCallInformation(
++    const std::map<std::string, std::vector<CallGraphCall>> &Calls) {
++  
++  for (const auto& It : Calls) {
++    auto& InsertCalls = this->Calls[It.first];
++    
++    std::copy(It.second.begin(), It.second.end(),
++              std::inserter(InsertCalls, InsertCalls.end()));
++  }
++}
++
++/// Adds additional basic block transition information to this call graph
++///
++/// \param Transitions The basic block transitions to add
++void CallGraph::addTransitionInformation(
++    const std::map<std::string, std::vector<std::string>> &Transitions) {
++  
++  for (const auto& It : Transitions) {
++    auto& InsertTransitions = this->Transitions[It.first];
++    
++    std::copy(It.second.begin(), It.second.end(),
++              std::inserter(InsertTransitions, InsertTransitions.end()));
++  }
++}
++
++/// Maps all important information from the function mapping into a internal
++/// data structure for faster lookup
++/// \param Mapping The function mapping
++void CallGraph::mapInformation(FunctionMapping &Mapping) {
++  for (MappingInfo &func : Mapping.getFunctions()) {
++    // Map indirect calls
++    if (Mapping.has_address_taken(&func))
++      IndirectCallable[func.type].insert(func.name);
++    
++    // Map referenced functions
++    ReferencedFunctions[func.name].insert(std::begin(func.argumentReferences),
++                                          std::end(func.argumentReferences));
++    
++    // Map alias
++    Alias[func.name].insert(std::begin(func.alias), std::end(func.alias));
++  }
++}
++
++/// Merges two call graphs together
++/// Call graph given in parameter is getting merged into the current instance
++void CallGraph::merge_into(const CallGraph& rhs) {
++  Calls.insert(std::begin(rhs.Calls), std::end(rhs.Calls));
++  Transitions.insert(std::begin(rhs.Transitions), std::end(rhs.Transitions));
++  
++  Starts.insert(std::begin(rhs.Starts), std::end(rhs.Starts));
++  Ends.insert(std::begin(rhs.Ends), std::end(rhs.Ends));
++}
++
++/// Gets all starting blocks that can occur for a given call graph entry
++///
++/// Can return multiple basic block names if the call is a indirect call and
++/// there are multiple possibilites for the given function
++std::set<std::pair<std::string, std::string>> CallGraph::getStartingBasicBlocks(
++    const CallGraphCall& Call) {
++  
++  std::set<std::pair<std::string, std::string>> ReturnValue;
++  
++  if (Call.Type == TYPE_CALLTARGET) {
++    // If we have a simple calltarget, just search the starting basic block
++    // for the given function
++    for (const auto& Start : Starts) {
++      if (Start.rfind(Call.Content + "_", 0) == 0) {
++        ReturnValue.insert({Start, Call.Content});
++        break;
++      }
++    }
++    
++    // Also, add possible alias of the function
++    for (const auto& A : Alias[Call.Content]) {
++      CallGraphCall FakeCall = {A, 0, "calltarget"};
++      
++      const auto Ret = getStartingBasicBlocks(FakeCall);
++      ReturnValue.insert(std::begin(Ret), std::end(Ret));
++    }
++    
++  } else if (Call.Type == TYPE_INDIRECT_CALLTARGET) {
++    // For a indirect call, there can be multiple functions that correspond
++    // to the given function type. Uses previously mapped functions from
++    // mapIndirectFunctions()
++    for (const auto& Func : IndirectCallable[Call.Content]) {
++      const CallGraphCall FakeCall = {Func, 0, "calltarget"};
++      
++      const auto& Result = getStartingBasicBlocks(FakeCall);
++      ReturnValue.insert(Result.begin(), Result.end());
++    }
++  }
++  
++  return ReturnValue;
++}
++
++void CallGraph::_addSyscallOffsets(const std::string FunctionName) {
++  // check if we visit a new function, if so, we add its syscall offsets (if it has any) to the callgraph
++  if (visited_functions_offset.find(FunctionName) == visited_functions_offset.end()) {
++    auto sys_offsets = Mapping->getSyscallOffsets();
++    auto sys_offsets_iter = sys_offsets.find(FunctionName);
++
++    // function has syscall offsets
++    if (sys_offsets_iter != sys_offsets.end()) {
++      Mapping->addOffsetInformation(*sys_offsets_iter);
++    }
++
++    // we already added all syscall to offset mappings where we know both
++    // now we add our wildcards as we don't know the syscall number for that offset.
++    // This is only a limitation of our proof-of-concept implementation
++    auto unkown_syscalls_known_offset = Mapping->getUnkownSyscallsToKnownOffsets();
++    auto unkown_syscalls_known_offset_iter = unkown_syscalls_known_offset.find(FunctionName);
++    if (unkown_syscalls_known_offset_iter != unkown_syscalls_known_offset.end()) {
++      std::set<int> offsets;
++      for (auto offset : unkown_syscalls_known_offset_iter->second) {
++        offsets.insert(offset);
++      }
++
++      Mapping->addUnknownSyscallKnownOffsetInformation(FunctionName, offsets);
++    }
++
++    // don't need to process that function again, so skip it if we encounter it again
++    visited_functions_offset.insert(FunctionName);
++  }
++}
++
++void CallGraph::addSyscallOffsets(const std::string FunctionName) {
++  // check if we visit a new function, if so, we add its syscall offsets (if it has any) to the callgraph
++  if (visited_functions_offset.find(FunctionName) == visited_functions_offset.end()) {
++    _addSyscallOffsets(FunctionName);
++    // don't need to process that function again, so skip it if we encounter it again
++    visited_functions_offset.insert(FunctionName);
++
++    // we have added the original function, now let us deal with function aliases on that function
++    MappingInfo mapping_info;
++    for (const auto info : Mapping->getFunctions()) {
++      if (info.name == FunctionName) {
++        mapping_info = info;
++        break;
++      }
++    }
++    for (const auto alias : mapping_info.alias) {
++      _addSyscallOffsets(alias);
++    }
++  }
++}
++
++/// Gets all possible syscall transitions starting from the given basic block
++///
++/// \param BB Name of the starting basic block from where syscall transitions
++/// are searched
++/// \param LastBB The previous basic block we have visited before
++/// \param FunctionName The name of the function we currently visit
++/// \param Mapping Reference to the function mapping to record
++///                syscall transitions
++/// \param LastSyscall The last syscall we saw before, -1 if none exists
++/// \return All syscalls that happened in the current basic block
++std::set<int> CallGraph::visit(const std::string& BB,
++                               const std::string& FunctionName,
++                               int LastSyscall /* = {-1} */) {
++  Visited.insert({BB, LastSyscall});
++
++  addSyscallOffsets(FunctionName);
++
++  std::set<int> LastSyscalls{LastSyscall};
++  for (const auto& Call : Calls[BB]) {
++    if (Call.Type == TYPE_SYSCALL) {
++      int Syscall = std::stoi(Call.Content);
++      // we need to differentiate here:
++      // if the syscall is > 0, then we have a normal syscall, ie a location where only one syscall number can occur
++      // if syscall is < 0, then we have a syscall location where the syscall number is passed via to the function as a parameter, ie we don't know the number
++      // hence, we need to pattern match
++      if (Syscall == -1) {
++        // get the functions that have been included for this functions, ie the functions that actually provide the syscall number
++        auto setxid_iter = setxid_mapping.find(FunctionName);
++        std::set<int> Syscalls;
++        if (setxid_iter != setxid_mapping.end()) {
++          for (int Last : LastSyscalls) {
++            for (auto func : setxid_iter->second) {
++              Mapping->addSyscallTransition(Last, func.second);
++              Syscalls.insert(func.second);
++            }
++          }
++        }
++        LastSyscalls = std::move(Syscalls);
++      } else {
++        for (int Last : LastSyscalls) {
++          // if (Mapping->addSyscallTransition(Last, Syscall))
++          //   llvm::errs() << Last << " -> " << Syscall << "\n";
++          Mapping->addSyscallTransition(Last, Syscall);
++        }
++        LastSyscalls = {Syscall};
++      }
++    } else if (Call.Type == TYPE_SYSCALL_SYSCALL) {
++      int Syscall = std::stoi(Call.Content);
++
++      addSyscallOffsets("syscall");
++
++      for (int Last : LastSyscalls)
++        // if (Mapping->addSyscallTransition(Last, Syscall))
++        //   llvm::errs() << Last << " -> " << Syscall << "\n";
++        Mapping->addSyscallTransition(Last, Syscall);
++
++      LastSyscalls = {Syscall};
++    } else if (Call.Type == TYPE_SYSCALL_SYSCALL_CP) {
++      int Syscall = std::stoi(Call.Content);
++
++      // sccp is a weak alias of __syscall_cp_c, so we add both in case a strong definition exists
++      // in case the strong definition exists, we also need to add __syscall_cp_asm as it performs the actual syscall in the strong definition of __syscall_cp_asm
++      addSyscallOffsets("__syscall_cp_c");
++      addSyscallOffsets("sccp");
++      addSyscallOffsets("__syscall_cp_asm");
++
++      for (int Last : LastSyscalls)
++        // if (Mapping->addSyscallTransition(Last, Syscall))
++        //   llvm::errs() << Last << " -> " << Syscall << "\n";
++        Mapping->addSyscallTransition(Last, Syscall);
++
++      LastSyscalls = {Syscall};
++    } else {
++      const auto Successors = visitFunction(Call, LastSyscalls);
++      if (!Successors.empty()) {
++        LastSyscalls = Successors;
++      }
++    }
++    
++    for (const auto& Reference : ReferencedFunctions[FunctionName]) {
++      addSyscallOffsets(FunctionName);
++      CallGraphCall FakeCall = {Reference, 0, "calltarget"};
++      auto Successors = visitFunction(FakeCall, LastSyscalls);
++      LastSyscalls.insert(std::begin(Successors), std::end(Successors));
++    }
++  }
++  
++  if (Transitions[BB].empty()) {
++    return LastSyscalls;
++  }
++  
++  std::set<int> ReturnValue;
++  for (const auto& Transition : Transitions[BB]) {
++    for (int Last : LastSyscalls) {
++      if (Visited.find({Transition, Last}) == Visited.end()) {
++        const auto Ret = visit(Transition, FunctionName, Last);
++        ReturnValue.insert(std::begin(Ret), std::end(Ret));
++      }
++    }
++  }
++  
++  return ReturnValue;
++}
++
++/// Visits the start of a new function to find all syscall transitions
++///
++/// \param Call The information about the function which we want to visit
++/// \param LastSyscalls All syscalls which were previous from this function
++/// \param LastBB Which basic block we previously visited from that BB
++/// \param Mapping Reference to the function mapping to record
++///                syscall transitions
++/// \return All syscalls that happened in that function
++std::set<int> CallGraph::visitFunction(const CallGraphCall& Call,
++                                       const std::set<int>& LastSyscalls) {
++  auto* assembly = AssemblyCallGraph::findGraphByName(Call.Content);
++
++  std::set<int> Successors;
++  for (int Last : LastSyscalls) {
++    if (VisitedFunctions.find({Call.Content, Last}) != VisitedFunctions.end()) {
++      const auto& Ret = VisitedFunctions[{Call.Content, Last}];
++      Successors.insert(std::begin(Ret), std::end(Ret));
++      continue;
++    }
++    
++    VisitedFunctions[{Call.Content, Last}];
++    
++    std::set<int> Ret;
++    if (assembly) {
++      addSyscallOffsets(Call.Content);
++      Ret = assembly->visit(Call.Content, Mapping, Last);
++      Successors.insert(std::begin(Ret), std::end(Ret));
++    } else {
++      for (const auto& Start : getStartingBasicBlocks(Call)) {
++        Ret = visit(Start.first, Start.second, Last);
++        Successors.insert(std::begin(Ret), std::end(Ret));
++      }
++    }
++    
++    VisitedFunctions[{Call.Content, Last}] = Ret;
++  }
++  
++  return Successors;
++}
++
++std::vector<AssemblyCallGraph> AssemblyCallGraph::AssemblyCallGraphs;
++
++/// Adds additional basic block syscall information to this call graph
++///
++/// \param Syscalls The syscalls with their corresponding basic block
++void AssemblyCallGraph::addSyscallInformation(
++    const std::map<std::string, std::vector<AssemblySyscall>> &Syscalls) {
++  
++  for (const auto& It : Syscalls) {
++    auto& InsertCalls = this->Syscalls[It.first];
++    
++    std::copy(It.second.begin(), It.second.end(),
++              std::inserter(InsertCalls, InsertCalls.end()));
++  }
++}
++
++/// Adds additional basic block transition information to this call graph
++///
++/// \param Transitions The basic block transitions to add
++void AssemblyCallGraph::addTransitionInformation(
++    const std::map<std::string, std::vector<std::string>> &Transitions) {
++  
++  for (const auto& It : Transitions) {
++    auto& InsertTransitions = this->Transitions[It.first];
++    
++    std::copy(It.second.begin(), It.second.end(),
++              std::inserter(InsertTransitions, InsertTransitions.end()));
++  }
++}
++
++/// Tries to find a assembly call graph by the function name
++///
++/// \param Name The name of the function which is getting searched
++/// \return Pointer to the assembly call graph or nullptr if not found
++AssemblyCallGraph* AssemblyCallGraph::findGraphByName(std::string Name) {
++  auto It = std::find_if(AssemblyCallGraphs.begin(), AssemblyCallGraphs.end(),
++                         [Name](const AssemblyCallGraph& graph) {
++                           const auto& Functions = graph.Functions;
++    
++                           return std::find(Functions.begin(), Functions.end(),
++                                            Name) != Functions.end();
++                         });
++  
++  if (It != AssemblyCallGraphs.end())
++    return &(*It);
++  
++  return nullptr;
++}
++
++/// Gets all possible assembly syscall transitions starting from the given
++/// basic block
++///
++/// \param BB Name of the starting basic block from where syscall transitions
++/// are searched
++/// \param LastBB The previous basic block we have visited before
++/// \param FunctionName The name of the function we currently visit
++/// \param Mapping Reference to the function mapping to record
++///                syscall transitions
++/// \param LastSyscall The last syscall we saw before, -1 if none exists
++/// \return All syscalls that happened in the current basic block
++std::set<int> AssemblyCallGraph::visit(const std::string &BB,
++                                       FunctionMapping* Mapping,
++                                       int LastSyscall /* = {-1} */) {
++  Visited.insert({BB, LastSyscall});
++
++  for (const auto& Syscall : Syscalls[BB]) {
++    // if (Mapping->addSyscallTransition(LastSyscall, Syscall.Syscall)) {
++    //   llvm::errs() << LastSyscall << " -> " << Syscall.Syscall << "\n";
++    // }
++    Mapping->addSyscallTransition(LastSyscall, Syscall.Syscall);
++    
++    LastSyscall = Syscall.Syscall;
++  }
++  
++  if (Transitions[BB].empty()) {
++    return {LastSyscall};
++  }
++  
++  std::set<int> ReturnValue;
++  // Visit all basic blocks that are the successor of our current one
++  for (const auto& Transition : Transitions[BB]) {
++    if (Visited.find({Transition, LastSyscall}) == Visited.end()) {
++      const auto& Ret = visit(Transition, Mapping, LastSyscall);
++      ReturnValue.insert(std::begin(Ret), std::end(Ret));
++    }
++  }
++  
++  return ReturnValue;
++}
++
++/// ---------------------------------------------------
++///
++/// End of call graph code
++///
++/// ----------------------------------------------------
++
+diff --git a/lld/ELF/CallHierarchy.h b/lld/ELF/CallHierarchy.h
+new file mode 100644
+index 00000000000..6f51270f7f2
+--- /dev/null
++++ b/lld/ELF/CallHierarchy.h
+@@ -0,0 +1,153 @@
++//===- CallHierarchy.h ------------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLD_ELF_CALL_HIERARCHY_H
++#define LLD_ELF_CALL_HIERARCHY_H
++
++#include <map>
++#include <memory>
++#include <set>
++#include <sstream>
++#include <stack>
++#include <string>
++#include <vector>
++#include <algorithm>
++
++struct AssemblySyscall {
++  int64_t Syscall;
++  int64_t Line;
++  std::string Label;
++  
++  std::string toString() const {
++    return std::to_string(Syscall) + "-" + Label;
++  }
++  
++  // Here, we are misusing the std::set a little
++  // If the Line Numbers are different, we just sort the call graph entries
++  // by Line Number. If they are the same, we compare the other information
++  // so that no duplicated information is added twice
++  bool operator<(const AssemblySyscall& Other) const {
++    if (Line != Other.Line) {
++      return Line < Other.Line;
++    }
++    
++    return toString() < Other.toString();
++  }
++};
++
++struct CallGraphCall {
++  std::string Content;
++  int64_t Line;
++  std::string Type;
++  
++  std::string toString() const {
++    return Type + "-" + Content;
++  }
++  
++  // Here, we are misusing the std::set a little
++  // If the Line Numbers are different, we just sort the call graph entries
++  // by Line Number. If they are the same, we compare the other information
++  // so that no duplicated information is added twice
++  bool operator<(const CallGraphCall& Other) const {
++    if (Line != Other.Line) {
++      return Line < Other.Line;
++    }
++    
++    return toString() < Other.toString();
++  }
++};
++
++class FunctionMapping;
++struct MappingInfo;
++
++// Wrapper for the final result which gets mapped into JSON
++struct SyscallCallGraph {
++  std::map<int, std::set<int>> Transitions;
++  std::map<std::string, std::map<std::string, std::set<int>>> Offsets;
++  std::map<std::string, std::set<int>> unknown_syscalls;
++};
++
++class AssemblyCallGraph {
++public:
++  static std::vector<AssemblyCallGraph> AssemblyCallGraphs;
++  static AssemblyCallGraph* findGraphByName(std::string Name);
++  
++  std::vector<std::string> Functions;
++  std::map<std::string, std::set<AssemblySyscall>> Syscalls;
++  std::map<std::string, std::set<std::string>> Transitions;
++  
++  void addSyscallInformation(
++      const std::map<std::string, std::vector<AssemblySyscall>>& Syscalls);
++  
++  void addTransitionInformation(
++      const std::map<std::string, std::vector<std::string>>& Transitions);
++  
++  std::set<int> visit(const std::string& BB,
++                      FunctionMapping* Mapping,
++                      int LastSyscall = -1);
++
++private:
++  // Set to save which BB we already visited with which last syscall
++  std::set<std::pair<std::string, int>> Visited;
++};
++
++class CallGraph {
++public:
++  std::map<std::string, std::set<CallGraphCall>> Calls;
++  std::map<std::string, std::set<std::string>> Transitions;
++  std::set<std::string> Starts;
++  std::set<std::string> Ends;
++  
++  void addCallInformation(
++      const std::map<std::string, std::vector<CallGraphCall>>& Calls);
++  
++  void addTransitionInformation(
++      const std::map<std::string, std::vector<std::string>>& Transitions);
++  
++  void merge_into(const CallGraph& rhs);
++  void mapInformation(FunctionMapping& Mapping);
++  void setFunctionMapping(FunctionMapping* Mapping);
++  
++  std::set<std::pair<std::string, std::string>> getStartingBasicBlocks(
++      const CallGraphCall& Call);
++  
++  std::set<int> visitFunction(const CallGraphCall& Call,
++                              const std::set<int>& LastSyscalls);
++  
++  std::set<int> visit(const std::string& BB,
++                      const std::string& FunctionName,
++                      int LastSyscall = -1);
++
++  void _addSyscallOffsets(const std::string FunctionName);
++  void addSyscallOffsets(const std::string FunctionName); // this is a wrapper around the underline version of that function as it deals with function aliases
++
++private:
++  // Cache of complete function calls with last syscall and last BB with return value
++  std::map<std::pair<std::string, int>, std::set<int>> VisitedFunctions;
++
++  // Set to save which BB we already visited with which last syscall
++  std::set<std::pair<std::string, int>> Visited;
++  std::set<std::string> visited_functions_offset;
++  
++  FunctionMapping* Mapping;
++  
++  // Information we got from the function mapping
++  std::map<std::string, std::set<std::string>> IndirectCallable;
++  std::map<std::string, std::set<std::string>> ReferencedFunctions;
++  std::map<std::string, std::set<std::string>> Alias;
++};
++
++namespace lld {
++namespace elf {
++
++template <class ELFT> void combineCallHierarchyInfo();
++
++} // namespace elf
++} // namespace lld
++
++#endif
+diff --git a/lld/ELF/Config.h b/lld/ELF/Config.h
+index ef1edbcd199..23db696f286 100644
+--- a/lld/ELF/Config.h
++++ b/lld/ELF/Config.h
+@@ -145,6 +145,7 @@ struct Configuration {
+   bool dependentLibraries;
+   bool disableVerify;
+   bool ehFrameHdr;
++  bool embedCallhierarchy;
+   bool emitLLVM;
+   bool emitRelocs;
+   bool enableNewDtags;
+diff --git a/lld/ELF/Driver.cpp b/lld/ELF/Driver.cpp
+index 25330832339..a87946ecf82 100644
+--- a/lld/ELF/Driver.cpp
++++ b/lld/ELF/Driver.cpp
+@@ -23,6 +23,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "Driver.h"
++#include "CallHierarchy.h"
+ #include "Config.h"
+ #include "ICF.h"
+ #include "InputFiles.h"
+@@ -866,6 +867,8 @@ static void readConfigs(opt::InputArgList &args) {
+   config->dynamicLinker = getDynamicLinker(args);
+   config->ehFrameHdr =
+       args.hasFlag(OPT_eh_frame_hdr, OPT_no_eh_frame_hdr, false);
++  config->embedCallhierarchy =
++      args.hasFlag(OPT_fembed_callhierarchy, OPT_no_fembed_callhierarchy, false);
+   config->emitLLVM = args.hasArg(OPT_plugin_opt_emit_llvm, false);
+   config->emitRelocs = args.hasArg(OPT_emit_relocs);
+   config->callGraphProfileSort = args.hasFlag(
+@@ -1969,6 +1972,9 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
+   // processSectionCommands() so that they can be placed by SECTIONS commands.
+   createSyntheticSections<ELFT>();
+ 
++  // Combine the call hierarchy notes into a single note.
++  combineCallHierarchyInfo<ELFT>();
++
+   // Some input sections that are used for exception handling need to be moved
+   // into synthetic sections. Do that now so that they aren't assigned to
+   // output sections in the usual way.
+diff --git a/lld/ELF/Options.td b/lld/ELF/Options.td
+index ea78a352621..e0f586bb9f2 100644
+--- a/lld/ELF/Options.td
++++ b/lld/ELF/Options.td
+@@ -166,6 +166,11 @@ defm fatal_warnings: B<"fatal-warnings",
+     "Treat warnings as errors",
+     "Do not treat warnings as errors (default)">;
+ 
++def fembed_callhierarchy: Flag<["--", "-"], "fembed-callhierarchy">,
++    HelpText<"Embed callhierarchy information as note into the binary.">;
++def no_fembed_callhierarchy: Flag<["--", "-"], "fno-embed-callhierarchy">,
++    HelpText<"Omit callhierarchy information in input section notes. (default)">;
++
+ defm filter: Eq<"filter", "Set DT_FILTER field to the specified name">;
+ 
+ defm fini: Eq<"fini", "Specify a finalizer function">, MetaVarName<"<symbol>">;
+diff --git a/lld/ELF/SyntheticSections.cpp b/lld/ELF/SyntheticSections.cpp
+index ea6eab4b47a..53a593a96ed 100644
+--- a/lld/ELF/SyntheticSections.cpp
++++ b/lld/ELF/SyntheticSections.cpp
+@@ -331,6 +331,22 @@ void BuildIdSection::writeTo(uint8_t *buf) {
+   hashBuf = buf + 16;
+ }
+ 
++NoteSection::NoteSection(StringRef sectionName, uint32_t noteType,
++                         StringRef noteName, StringRef noteDescription)
++    : SyntheticSection(SHF_ALLOC, SHT_NOTE, 4, sectionName), type{noteType},
++      name{noteName}, description{noteDescription} {}
++
++void NoteSection::writeTo(uint8_t *buf) {
++  size_t descStart = 3 * 4 + llvm::alignTo(name.length() + 1, 4);
++
++  write32(buf, name.length() + 1);                  // Name size
++  write32(buf + 4, description.length() + 1);       // Content size
++  write32(buf + 8, type);                           // Type
++  memcpy(buf + 12, name.data(), name.length() + 1); // Name string
++  memcpy(buf + descStart, description.data(),
++         description.length() + 1);                 // Description string
++}
++
+ void BuildIdSection::writeBuildId(ArrayRef<uint8_t> buf) {
+   assert(buf.size() == hashSize);
+   memcpy(hashBuf, buf.data(), hashSize);
+diff --git a/lld/ELF/SyntheticSections.h b/lld/ELF/SyntheticSections.h
+index 5f59178fb54..4e6ae7579d2 100644
+--- a/lld/ELF/SyntheticSections.h
++++ b/lld/ELF/SyntheticSections.h
+@@ -26,6 +26,7 @@
+ #include "llvm/ADT/MapVector.h"
+ #include "llvm/MC/StringTableBuilder.h"
+ #include "llvm/Support/Endian.h"
++#include "llvm/Support/MathExtras.h"
+ #include <functional>
+ 
+ namespace lld {
+@@ -174,6 +175,33 @@ private:
+   uint8_t *hashBuf;
+ };
+ 
++// .note section with a single note entry.
++//
++// An ELF note entry corresponds to the following structure:
++//
++//     struct Note {
++//         uint32_t n_namesz;             // length of the name incl. binary 0
++//         uint32_t n_descsz;             // length of the description incl. 0
++//         uint32_t n_type = 0xdeadbeef;  // arbitrary positive integer
++//         _Alignas(4) uint8_t name[n_namesz] = "NameString"
++//         _Alignas(4) uint8_t description[n_descsz] = "DescriptionString"
++//     };
++//
++class NoteSection : public SyntheticSection {
++  uint32_t type;
++  std::string name;
++  std::string description;
++
++public:
++  NoteSection(StringRef sectionName, uint32_t noteType, StringRef noteName,
++              StringRef noteDescription);
++  void writeTo(uint8_t *buf) override;
++  size_t getSize() const override {
++    return 3 * 4 + llvm::alignTo(name.length() + 1, 4) +
++           llvm::alignTo(description.length() + 1, 4);
++  }
++};
++
+ // BssSection is used to reserve space for copy relocations and common symbols.
+ // We create three instances of this class for .bss, .bss.rel.ro and "COMMON",
+ // that are used for writable symbols, read-only symbols and common symbols,
+diff --git a/llvm/include/llvm/Analysis/CallHierarchyAnalysis.h b/llvm/include/llvm/Analysis/CallHierarchyAnalysis.h
+new file mode 100644
+index 00000000000..1b296d84f6d
+--- /dev/null
++++ b/llvm/include/llvm/Analysis/CallHierarchyAnalysis.h
+@@ -0,0 +1,125 @@
++//===- CallHierarchyAnalysis.h ----------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++///
++/// Implements a call hierarchy analysis which reports an over approximation of
++/// external functions that can be called via the different entry points.
++///
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_ANALYSIS_CALLHIERARCHYANALYSIS_H
++#define LLVM_ANALYSIS_CALLHIERARCHYANALYSIS_H
++
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/SetVector.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Support/JSON.h"
++
++#include <string>
++#include <set>
++
++namespace llvm {
++
++class CallHierarchy {
++  const std::string TYPE_SYSCALL = "syscall";
++  const std::string TYPE_SYSCALL_SYSCALL = "syscall_syscall";
++  const std::string TYPE_SYSCALL_SYSCALL_CP = "syscall_syscall_cp";
++  const std::string TYPE_CALLTARGET = "calltarget";
++  const std::string TYPE_INDIRECT_CALLTARGET = "indirect_calltarget";
++  const std::string EXIT_FUNC_NAME = "exit";
++  
++public:
++  struct BasicBlockCall {
++    std::string Content;
++    std::string Type;
++    int64_t LineNumber;
++    
++    bool operator<(const BasicBlockCall& Other) const {
++      return LineNumber < Other.LineNumber;
++    }
++  };
++  
++  struct ReachabilityResult {
++    SmallSetVector<const GlobalValue *, 16> CallTargets;
++    SmallSetVector<const FunctionType *, 4> IndirectCallTypes;
++    SmallSetVector<const GlobalValue *, 8> ReferencedFunctions;
++    SmallSetVector<unsigned, 256> SyscallNumbers;
++  
++    // Call Graph Information
++    std::string StartBB;
++    std::string EndBB;
++    std::map<const BasicBlock*, std::set<const BasicBlock*>> Transitions;
++    std::map<const BasicBlock*, std::set<BasicBlockCall>> BasicBlockCalls;
++    std::set<std::string> Alias;
++    std::set<std::string> ArgumentReferences;
++
++    bool isInteresting() const {
++      return CallTargets.size() || IndirectCallTypes.size() ||
++             ReferencedFunctions.size() || SyscallNumbers.size();
++    }
++  };
++  
++  SmallSetVector<const GlobalValue *, 8> HasAddressTaken;
++  DenseMap<const GlobalValue *, ReachabilityResult> FunctionMapping;
++
++  CallHierarchy(Module &M);
++  CallHierarchy(CallHierarchy &&G);
++  ~CallHierarchy();
++
++  bool isExtern(const GlobalValue *) const;
++  const FunctionType *getType(const GlobalValue *) const;
++  
++  void createFunctionCallGraph(Function* F, ReachabilityResult& Res);
++  void searchForCalls(Function *F, Instruction& I, ReachabilityResult& Res, int64_t LineNumber,
++                      std::set<BasicBlockCall>& Calls);
++
++  void addReferences(Value *Op, SmallSetVector<const GlobalValue *, 8> &refs,
++                     ReachabilityResult* Res = nullptr);
++  void addReferences(Value *Op, SmallSetVector<const GlobalValue *, 8> &refs,
++                     SmallSetVector<const Value *, 8> &visited,
++                     ReachabilityResult* Res = nullptr);
++};
++
++/// An analysis pass which computes the call hierarchy for a module.
++class CallHierarchyAnalysis : public AnalysisInfoMixin<CallHierarchyAnalysis> {
++  friend AnalysisInfoMixin<CallHierarchyAnalysis>;
++
++  static AnalysisKey Key;
++
++public:
++  /// Inform generic clients of the result type.
++  using Result = CallHierarchy;
++
++  /// Compute the \c CallHierarchy for the module \c M.
++  CallHierarchy run(Module &M, ModuleAnalysisManager &) {
++    return CallHierarchy(M);
++  }
++};
++
++/// A pass which prints the call hierarchy to a \c raw_ostream.
++///
++/// This is primarily useful for testing the analysis.
++class CallHierarchyPrinterPass
++    : public PassInfoMixin<CallHierarchyPrinterPass> {
++  raw_ostream &OS;
++
++public:
++  explicit CallHierarchyPrinterPass(raw_ostream &OS);
++
++  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
++};
++
++namespace json {
++Value toJSON(const CallHierarchy &Analysis);
++} // namespace json
++} // namespace llvm
++
++#endif // LLVM_ANALYSIS_CALLHIERARCHYANALYSIS_H
+diff --git a/llvm/include/llvm/Analysis/LazyCallGraph.h b/llvm/include/llvm/Analysis/LazyCallGraph.h
+index 76905c8d05d..ff24a6f0abc 100644
+--- a/llvm/include/llvm/Analysis/LazyCallGraph.h
++++ b/llvm/include/llvm/Analysis/LazyCallGraph.h
+@@ -380,6 +380,9 @@ public:
+       return populateSlow();
+     }
+ 
++  /// Stores signatures for indirectly called functions.
++  SmallPtrSet<FunctionType *, 4> IndirectCallSignatures;
++
+   private:
+     LazyCallGraph *G;
+     Function *F;
+@@ -406,7 +409,10 @@ public:
+     /// the other.
+     void replaceFunction(Function &NewF);
+ 
+-    void clear() { Edges.reset(); }
++    void clear() {
++      Edges.reset();
++      IndirectCallSignatures.clear();
++    }
+ 
+     /// Print the name of this node's function.
+     friend raw_ostream &operator<<(raw_ostream &OS, const Node &N) {
+@@ -932,7 +938,8 @@ public:
+   /// No function definitions are scanned until their nodes in the graph are
+   /// requested during traversal.
+   LazyCallGraph(Module &M,
+-                function_ref<TargetLibraryInfo &(Function &)> GetTLI);
++                function_ref<TargetLibraryInfo &(Function &)> GetTLI,
++                bool SkipDecls = true);
+ 
+   LazyCallGraph(LazyCallGraph &&G);
+   LazyCallGraph &operator=(LazyCallGraph &&RHS);
+@@ -1131,6 +1138,10 @@ private:
+   /// escape at the module scope.
+   EdgeSequence EntryEdges;
+ 
++  /// Config flag that selects if calls to functions that are only declared
++  /// but not defined should be omitted from the call graph edges.
++  bool SkipDeclarations;
++
+   /// Allocator that holds all the call graph SCCs.
+   SpecificBumpPtrAllocator<SCC> SCCBPA;
+ 
+diff --git a/llvm/include/llvm/AsmParser/AssemblySyscall.h b/llvm/include/llvm/AsmParser/AssemblySyscall.h
+new file mode 100644
+index 00000000000..198272f7f00
+--- /dev/null
++++ b/llvm/include/llvm/AsmParser/AssemblySyscall.h
+@@ -0,0 +1,102 @@
++#ifndef LLVM_ASSEMBLYSYSCALL_H
++#define LLVM_ASSEMBLYSYSCALL_H
++
++#include "llvm/Support/JSON.h"
++
++#include <fstream>
++#include <iostream>
++#include <set>
++
++namespace llvm {
++
++struct AssemblySyscallCallSite {
++  int64_t Syscall;
++  int64_t LineNumber;
++  std::string Label;
++};
++
++class AssemblySyscall {
++private:
++  std::map<std::string, std::vector<AssemblySyscallCallSite>> Syscalls;
++  std::map<std::string, std::set<std::string>> Transitions;
++  std::string last_block_inserted;
++
++public:
++  static AssemblySyscall &getInstance() {
++    static AssemblySyscall Instance;
++    return Instance;
++  }
++
++  void addSyscall(std::string Label, int64_t Syscall,
++                  std::string BasicBlock, int64_t LineNumber) {
++    Syscalls[BasicBlock].push_back({Syscall, LineNumber, Label});
++    last_block_inserted = BasicBlock;
++  }
++
++  AssemblySyscallCallSite *getLastAssemblyCallSite() {
++    if(last_block_inserted != "")
++      return &Syscalls[last_block_inserted].back();
++    else
++      return nullptr;
++  }
++  
++  void addTransition(std::string From, std::string To) {
++    Transitions[From].insert(To);
++  }
++  
++  bool hasContent() {
++    return !Syscalls.empty() || !Transitions.empty();
++  }
++  
++  json::Value toJSON() {
++    json::Object Labels;
++    for (const auto &Entry : Syscalls) {
++      json::Array Calls;
++      for (const auto& CallSite : Entry.second) {
++        json::Object Call;
++        
++        Call["syscall"] = CallSite.Syscall;
++        Call["label"] = CallSite.Label;
++        Call["line"] = CallSite.LineNumber;
++        
++        Calls.push_back(std::move(Call));
++      }
++      
++      Labels[Entry.first] = std::move(Calls);
++    }
++  
++    json::Object Transition;
++    for (const auto& It : Transitions) {
++      json::Array PossibleTransitions;
++      for (const auto& T : It.second) {
++        PossibleTransitions.push_back(T);
++      }
++      
++      Transition[It.first] = std::move(PossibleTransitions);
++    }
++    
++    json::Array Functions;
++    for (const auto& It : Transitions) {
++      Functions.push_back(It.first);
++    }
++    for (const auto& It : Syscalls) {
++      Functions.push_back(It.first);
++    }
++    
++    json::Object Root{{"transitions", std::move(Transition)},
++                      {"syscalls", std::move(Labels)},
++                      {"functions", std::move(Functions)}};
++    
++    return Root;
++  }
++
++private:
++  AssemblySyscall() {}
++
++public:
++  AssemblySyscall(AssemblySyscall const &) = delete;
++  void operator=(AssemblySyscall const &) = delete;
++};
++}
++
++#endif // LLVM_ASSEMBLYSYSCALL_H
+diff --git a/llvm/include/llvm/CodeGen/MachineFunction.h b/llvm/include/llvm/CodeGen/MachineFunction.h
+index 7f4a3a8c2f9..fadf3a210a2 100644
+--- a/llvm/include/llvm/CodeGen/MachineFunction.h
++++ b/llvm/include/llvm/CodeGen/MachineFunction.h
+@@ -822,6 +822,9 @@ public:
+   /// base.
+   MCSymbol *getPICBaseSymbol() const;
+ 
++  // getPICBaseSymbol but with a different name syntax
++  MCSymbol *getPICBaseSymbolSyscallOffset(std::string &name, int &syscall_number, size_t &number_of_syscall) const;
++
+   /// Returns a reference to a list of cfi instructions in the function's
+   /// prologue.  Used to construct frame maps for debug and exception handling
+   /// comsumers.
+diff --git a/llvm/include/llvm/IR/Function.h b/llvm/include/llvm/IR/Function.h
+index d9cbcc63fa6..cd1e2774f8f 100644
+--- a/llvm/include/llvm/IR/Function.h
++++ b/llvm/include/llvm/IR/Function.h
+@@ -329,6 +329,7 @@ public:
+     return AttributeSets.hasFnAttribute(Kind);
+   }
+ 
++
+   /// Return the attribute for the given attribute kind.
+   Attribute getFnAttribute(Attribute::AttrKind Kind) const {
+     return getAttribute(AttributeList::FunctionIndex, Kind);
+diff --git a/llvm/include/llvm/IR/Module.h b/llvm/include/llvm/IR/Module.h
+index 68cd583c136..953b1bd6d26 100644
+--- a/llvm/include/llvm/IR/Module.h
++++ b/llvm/include/llvm/IR/Module.h
+@@ -38,6 +38,7 @@
+ #include <memory>
+ #include <string>
+ #include <vector>
++#include <deque>
+ 
+ namespace llvm {
+ 
+@@ -189,6 +190,7 @@ private:
+                                   ///< Format: (arch)(sub)-(vendor)-(sys0-(abi)
+   void *NamedMDSymTab;            ///< NamedMDNode names.
+   DataLayout DL;                  ///< DataLayout associated with the module
++  std::map<std::string, std::deque<int>> syscall_mapping;   ///< Mapping syscall numbers to functions
+ 
+   friend class Constant;
+ 
+@@ -240,6 +242,10 @@ public:
+   /// @returns a string containing the target triple.
+   const std::string &getTargetTriple() const { return TargetTriple; }
+ 
++  /// Get the syscall mapping for this module
++  /// @returns a map mapping function names to syscalls in the order they appear in
++  const std::map<std::string, std::deque<int>> &getSyscallMapping() const { return syscall_mapping; }
++
+   /// Get the global data context.
+   /// @returns LLVMContext - a container for LLVM's global information
+   LLVMContext &getContext() const { return Context; }
+@@ -283,6 +289,11 @@ public:
+   /// Set the target triple.
+   void setTargetTriple(StringRef T) { TargetTriple = T; }
+ 
++  /// add a syscall to the mapping
++  void addSyscall(std::string func_name, int sys_nr) {
++    syscall_mapping[func_name].push_back(sys_nr);
++  }
++
+   /// Set the module-scope inline assembly blocks.
+   /// A trailing newline is added if the input doesn't have one.
+   void setModuleInlineAsm(StringRef Asm) {
+diff --git a/llvm/include/llvm/InitializePasses.h b/llvm/include/llvm/InitializePasses.h
+index a5e1310e28b..258840422e3 100644
+--- a/llvm/include/llvm/InitializePasses.h
++++ b/llvm/include/llvm/InitializePasses.h
+@@ -101,6 +101,7 @@ void initializeCallGraphDOTPrinterPass(PassRegistry&);
+ void initializeCallGraphPrinterLegacyPassPass(PassRegistry&);
+ void initializeCallGraphViewerPass(PassRegistry&);
+ void initializeCallGraphWrapperPassPass(PassRegistry&);
++void initializeCallHierarchyPrinterLegacyPassPass(PassRegistry&);
+ void initializeCallSiteSplittingLegacyPassPass(PassRegistry&);
+ void initializeCalledValuePropagationLegacyPassPass(PassRegistry &);
+ void initializeCodeGenPreparePass(PassRegistry&);
+diff --git a/llvm/include/llvm/MC/MCObjectFileInfo.h b/llvm/include/llvm/MC/MCObjectFileInfo.h
+index 2f7f5d64b46..03412cdb362 100644
+--- a/llvm/include/llvm/MC/MCObjectFileInfo.h
++++ b/llvm/include/llvm/MC/MCObjectFileInfo.h
+@@ -215,6 +215,9 @@ protected:
+   MCSection *SXDataSection = nullptr;
+   MCSection *GFIDsSection = nullptr;
+   MCSection *GLJMPSection = nullptr;
++  
++  MCSection *AssemblySyscallsSection = nullptr;
++  MCSection *SyscallOffsetSection = nullptr;
+ 
+ public:
+   void InitMCObjectFileInfo(const Triple &TT, bool PIC, MCContext &ctx,
+@@ -391,6 +394,12 @@ public:
+   MCSection *getGFIDsSection() const { return GFIDsSection; }
+   MCSection *getGLJMPSection() const { return GLJMPSection; }
+ 
++  MCSection *getAssemblySyscallsSection() const {
++    return AssemblySyscallsSection;
++  }
++
++  MCSection *getSyscallOffsetSection() const { return SyscallOffsetSection; }
++
+   MCSection *getEHFrameSection() {
+     return EHFrameSection;
+   }
+diff --git a/llvm/include/llvm/Object/ELFTypes.h b/llvm/include/llvm/Object/ELFTypes.h
+index 7d1ade4d543..9b5512585e4 100644
+--- a/llvm/include/llvm/Object/ELFTypes.h
++++ b/llvm/include/llvm/Object/ELFTypes.h
+@@ -661,6 +661,7 @@ class Elf_Note_Iterator_Impl
+     }
+   }
+ 
++public:
+   Elf_Note_Iterator_Impl() {}
+   explicit Elf_Note_Iterator_Impl(Error &Err) : Err(&Err) {}
+   Elf_Note_Iterator_Impl(const uint8_t *Start, size_t Size, Error &Err)
+@@ -670,7 +671,6 @@ class Elf_Note_Iterator_Impl
+     advanceNhdr(Start, 0u);
+   }
+ 
+-public:
+   Elf_Note_Iterator_Impl &operator++() {
+     assert(Nhdr && "incremented ELF note end iterator");
+     const uint8_t *NhdrPos = reinterpret_cast<const uint8_t *>(Nhdr);
+diff --git a/llvm/include/llvm/Transforms/Instrumentation/CallHierarchy.h b/llvm/include/llvm/Transforms/Instrumentation/CallHierarchy.h
+new file mode 100644
+index 00000000000..2b33b7d384e
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Instrumentation/CallHierarchy.h
+@@ -0,0 +1,31 @@
++//===----------- Definition of the CallHierarchy class ----------*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file declares the CallHierarchy class which embeds the result of the
++// CallHierarchyAnalysis into the translation unit as ELF note.
++//
++//===----------------------------------------------------------------------===//
++#ifndef LLVM_TRANSFORMS_INSTRUMENTATION_CALLHIERARCHY_H
++#define LLVM_TRANSFORMS_INSTRUMENTATION_CALLHIERARCHY_H
++
++#include "llvm/IR/PassManager.h"
++
++namespace llvm {
++
++class CallHierarchyPass
++    : public PassInfoMixin<CallHierarchyPass> {
++public:
++  explicit CallHierarchyPass();
++
++  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
++};
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Analysis/Analysis.cpp b/llvm/lib/Analysis/Analysis.cpp
+index af718526684..1373b40687e 100644
+--- a/llvm/lib/Analysis/Analysis.cpp
++++ b/llvm/lib/Analysis/Analysis.cpp
+@@ -28,6 +28,7 @@ void llvm::initializeAnalysis(PassRegistry &Registry) {
+   initializeCallGraphDOTPrinterPass(Registry);
+   initializeCallGraphPrinterLegacyPassPass(Registry);
+   initializeCallGraphViewerPass(Registry);
++  initializeCallHierarchyPrinterLegacyPassPass(Registry);
+   initializeCostModelAnalysisPass(Registry);
+   initializeCFGViewerLegacyPassPass(Registry);
+   initializeCFGPrinterLegacyPassPass(Registry);
+diff --git a/llvm/lib/Analysis/CMakeLists.txt b/llvm/lib/Analysis/CMakeLists.txt
+index cc9ff0bc1f5..cf3850edcd4 100644
+--- a/llvm/lib/Analysis/CMakeLists.txt
++++ b/llvm/lib/Analysis/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_llvm_component_library(LLVMAnalysis
+   CGSCCPassManager.cpp
+   CallGraph.cpp
+   CallGraphSCCPass.cpp
++  CallHierarchyAnalysis.cpp
+   CallPrinter.cpp
+   CaptureTracking.cpp
+   CmpInstAnalysis.cpp
+diff --git a/llvm/lib/Analysis/CallHierarchyAnalysis.cpp b/llvm/lib/Analysis/CallHierarchyAnalysis.cpp
+new file mode 100644
+index 00000000000..9363bf61e58
+--- /dev/null
++++ b/llvm/lib/Analysis/CallHierarchyAnalysis.cpp
+@@ -0,0 +1,511 @@
++//===- CallHierarchyAnalysis.cpp - ----------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/Analysis/CallHierarchyAnalysis.h"
++
++#include "llvm/IR/CallSite.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/InlineAsm.h"
++#include "llvm/IR/TypeFinder.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Pass.h"
++#include "llvm/PassSupport.h"
++#include "llvm/IR/CFG.h"
++
++using namespace llvm;
++
++namespace {
++
++std::string dump_function_type(const FunctionType *Type) {
++  std::string TypeStr;
++  llvm::raw_string_ostream Strm(TypeStr);
++  Type->print(Strm);
++  Strm.flush();
++  return TypeStr;
++}
++
++void printMetadata(raw_ostream &OS, const GlobalValue *GV,
++                   const CallHierarchy &CH) {
++  OS << GV->getName();
++  if (GV->isDeclaration())
++    OS << ", declaration";
++  OS << ", linkage = " << GV->getLinkage() << ", ";
++  CH.getType(GV)->print(OS);
++  OS << "\n";
++}
++
++void printCallHierarchy(raw_ostream &OS, const Module &M,
++                        const CallHierarchy &CH) {
++  OS << "Printing the call graph for module: " << M.getModuleIdentifier()
++     << "\n";
++  
++  OS << "  External Functions:\n";
++  for (auto Entry : CH.FunctionMapping) {
++    const GlobalValue *GV = Entry.first;
++    if (!CH.isExtern(GV))
++      continue;
++    OS << "  * ";
++    printMetadata(OS, GV, CH);
++  }
++  OS << "\n";
++  
++  OS << "  Address Taken:\n";
++  for (const GlobalValue *GV : CH.HasAddressTaken) {
++    OS << "  * ";
++    printMetadata(OS, GV, CH);
++  }
++  OS << "\n";
++  
++  OS << "  Call Graph:\n";
++  for (auto Entry : CH.FunctionMapping) {
++    const GlobalValue *GV = Entry.first;
++    const CallHierarchy::ReachabilityResult &res = Entry.second;
++    if (CH.isExtern(GV))
++      continue;
++    OS << "  * ";
++    printMetadata(OS, GV, CH);
++    if (res.SyscallNumbers.size()) {
++      OS << "      Syscalls:";
++      for (auto Number : res.SyscallNumbers) {
++        OS << " " << Number;
++      }
++      OS << "\n";
++    }
++    if (res.CallTargets.size() || res.IndirectCallTypes.size()) {
++      OS << "      Calls:\n";
++      for (const GlobalValue *T : res.CallTargets)
++        OS << "      -> " << T->getName() << "\n";
++      for (const FunctionType *Type : res.IndirectCallTypes) {
++        OS << "      -> ";
++        Type->print(OS);
++        OS << "\n";
++      }
++    }
++    if (res.ReferencedFunctions.size()) {
++      OS << "      References:\n";
++      for (const GlobalValue *T : res.ReferencedFunctions)
++        OS << "       & " << T->getName() << "\n";
++    }
++    OS << "\n";
++  }
++}
++
++} // end anonymous namespace
++
++CallHierarchy::CallHierarchy(Module &M) {
++  // Construct a mapping for all functions and aliases that are of interest.
++  for (Function &F : M) {
++    if (F.getName().startswith("llvm.")) // ignore llvm intrinsics
++      continue;
++    FunctionMapping[&F];
++  }
++  for (GlobalAlias &GA : M.aliases()) {
++    Function *Func = dyn_cast<Function>(GA.getAliasee());
++    if (Func)
++      FunctionMapping[&GA];
++  }
++
++  // Traverse these functions and extract their call information and build
++  // the call graph.
++  for (auto &Entry : FunctionMapping) {
++    auto F = dyn_cast<Function>(const_cast<GlobalValue *>(Entry.first));
++    if (!F || F->isDeclaration())
++      continue;
++
++    auto &Res = Entry.second;
++    createFunctionCallGraph(F, Res);
++  }
++
++  // Iterate over the global initializers to find references to functions.
++  for (GlobalVariable &GV : M.globals())
++    if (GV.hasInitializer())
++      addReferences(GV.getInitializer(), HasAddressTaken);
++
++  // Aliases to internal functions get a copy of the analysis results and
++  // aliases to external functions are modeled as calling the function.
++  for (GlobalAlias &GA : M.aliases()) {
++    Function *Func = dyn_cast<Function>(GA.getAliasee());
++    if (!Func)
++      continue;
++
++    if (Func->hasLocalLinkage())
++      FunctionMapping[&GA] = FunctionMapping[Func];
++    else {
++      FunctionMapping[&GA].Alias.insert(Func->getName());
++      FunctionMapping[&GA].CallTargets.insert(Func);
++    }
++  }
++}
++
++CallHierarchy::CallHierarchy(CallHierarchy &&G)
++    : HasAddressTaken(std::move(G.HasAddressTaken)),
++      FunctionMapping(std::move(G.FunctionMapping)) {}
++
++CallHierarchy::~CallHierarchy() {}
++
++bool CallHierarchy::isExtern(const GlobalValue *GV) const {
++  auto F = dyn_cast<Function>(GV);
++  if (F)
++    return F->isDeclaration();
++  return dyn_cast<GlobalAlias>(GV) == nullptr;
++}
++
++const FunctionType *CallHierarchy::getType(const GlobalValue *GV) const {
++  auto F = dyn_cast<Function>(GV);
++  if (F)
++    return F->getFunctionType();
++
++  auto GA = dyn_cast<GlobalAlias>(GV);
++  return dyn_cast<Function>(GA->getAliasee())->getFunctionType();
++}
++
++void CallHierarchy::createFunctionCallGraph(Function* F,
++                                            ReachabilityResult& Res) {
++  auto GetName = [F](const BasicBlock* BB) {
++    std::string Str;
++    raw_string_ostream OS(Str);
++    
++    BB->printAsOperand(OS, false);
++    return F->getName() + "_" + OS.str();
++  };
++  
++  std::map<const Instruction*, int64_t> LineNumbers;
++  
++  // Build line number mapping
++  int64_t LineNumber{0};
++  for (BasicBlock& BB : *F) {
++    for (Instruction& I : BB) {
++      LineNumber++;
++      LineNumbers[&I] = LineNumber;
++    }
++  }
++  
++  Res.StartBB = GetName(&F->front()).str();
++  Res.EndBB = GetName(&F->back()).str();
++  
++  for (BasicBlock& BB : *F) {
++    for (auto* Successor : successors(&BB)) {
++      Res.Transitions[&BB].insert(Successor);
++    }
++    
++    for (Instruction& I : BB) {
++      searchForCalls(F, I, Res, LineNumbers[&I], Res.BasicBlockCalls[&BB]);
++    }
++  }
++}
++
++void CallHierarchy::searchForCalls(Function *F, Instruction &I, ReachabilityResult& Res,
++                                   int64_t LineNumber,
++                                   std::set<BasicBlockCall>& Calls) {
++
++
++  // the main function gets special treatment:
++  // Based on libc's implementation, a return goes back to libc_start_main_stage2, were emediately exit() is called.
++  // For our state machine, we need this call to exit as it performs cleanup on files, ie writes to them if buffers are not clear.
++  // The app would get killed if we don't inject a transition to exit
++  // We only inject it in our state machine info, not in the one for seccomp
++  // Note: this is just a hotfix, needs a proper solution
++  if (F->hasName() && F->getName() == "main") {
++    if(isa<ReturnInst>(&I)) {
++      Calls.insert({EXIT_FUNC_NAME, TYPE_CALLTARGET, LineNumber});
++      return; // we don't have any syscalls, references, aliases, or call targets in this case, so just return;
++    }
++  }
++  auto CS = CallSite(&I);
++  if (!CS) {
++    // Not a call, iterate over instruction operands to find references to
++    // functions.
++    for (Value *Op : I.operand_values())
++      addReferences(Op, Res.ReferencedFunctions, &Res);
++    return;
++  }
++
++  // Call, iterate over call arguments to find references to functions.
++  for (Value *Op : CS.args())
++    addReferences(Op, Res.ReferencedFunctions, &Res);
++  
++  // Handle aliases by treating them as regular functions when they
++  // are not interposable and as opaque aliases otherwise.
++  auto GA = dyn_cast<GlobalAlias>(CS.getCalledValue());
++  if (GA && FunctionMapping.count(GA)) {
++    Res.CallTargets.insert(GA);
++    Calls.insert({GA->getName(), TYPE_CALLTARGET, LineNumber});
++  }
++
++
++  // Special case for __syscall_cp and syscall. Check if current
++  // CallSite is such a call and extract the first argument.
++  // Also encode which is which for the linker as we need it to correctly determine the syscall offsets.
++  // DO NOT CHANGE TO JUST TYPE_CALLTARGET AS THIS BREAKS THE STATE MACHINE GENERATION
++  Function *Func = CS.getCalledFunction();
++  if (Func && !CS.arg_empty() && (Func->getName() == "__syscall_cp" || Func->getName() == "syscall")) {
++    auto arg = dyn_cast<ConstantInt>(CS.arg_begin());
++    if (arg) {
++      const auto Syscall = arg->getZExtValue();
++
++      Res.SyscallNumbers.insert(Syscall);
++      Res.CallTargets.insert(Func);
++      if(Func->getName() == "__syscall_cp")
++        Calls.insert({std::to_string(Syscall), TYPE_SYSCALL_SYSCALL_CP, LineNumber});
++      else
++        Calls.insert({std::to_string(Syscall), TYPE_SYSCALL_SYSCALL, LineNumber});
++      Func->getParent()->addSyscall(Func->getName(), Syscall);
++    }
++  } // Track functions that are directly called.
++  else if (Func && FunctionMapping.count(Func)) {
++    Res.CallTargets.insert(Func);
++    Calls.insert({Func->getName(), TYPE_CALLTARGET, LineNumber});
++  }
++
++  // Track signatures of functions that are indirectly called.
++  if (CS.isIndirectCall()) {
++    auto PT = cast<PointerType>(CS.getCalledValue()->getType());
++
++    auto* F = cast<FunctionType>(PT->getElementType());
++    Res.IndirectCallTypes.insert(F);
++    Calls.insert({dump_function_type(F), TYPE_INDIRECT_CALLTARGET, LineNumber});
++  }
++
++  // tail cails are tracked separately, but we get their name
++  // so add them as a direct call target
++  if (CS.isTailCall()) {
++    const GlobalValue *tail_call_func = dyn_cast<GlobalValue>(CS.getCalledValue());
++    if(tail_call_func && tail_call_func->getName() != "__syscall_cp" && tail_call_func->getName() != "syscall") {
++      Res.CallTargets.insert(tail_call_func);
++      Calls.insert({tail_call_func->getName(), TYPE_CALLTARGET, LineNumber});
++    }
++  }
++
++  // Check if it is inline assembly and has arguments. If it is we
++  // ensure that it is a syscall and that a constant integer is used
++  // as argument.
++  if (CS.isInlineAsm() && !CS.arg_empty()) {
++    CallBase *CB = dyn_cast<CallBase>(CS.getInstruction());
++    InlineAsm *in_asm = dyn_cast<InlineAsm>(CB->getCalledOperand());
++    // Architecture-specifc part: on x86 we need to find the syscall
++    // instruction, on arm svc 0 or svc #0
++    if (in_asm->getAsmString() == "syscall" ||
++        strstr(in_asm->getAsmString().c_str(), "svc 0") != 0 ||
++        strstr(in_asm->getAsmString().c_str(), "svc #0") != 0) {
++      ConstantInt *arg = dyn_cast<ConstantInt>(CS.arg_begin());
++      if (arg) {
++        auto Syscall = arg->getZExtValue();
++
++        Res.SyscallNumbers.insert(Syscall);
++        Calls.insert({std::to_string(Syscall), TYPE_SYSCALL, LineNumber});
++        I.getFunction()->getParent()->addSyscall(I.getFunction()->getName(), Syscall);
++      }
++      else {
++        errs() << "Couldn't cast syscall first parameter to "
++                  "ConstantInt\n";
++        // this should very rarely happen, the syscall number comes through a function parameter
++        // we need to track this for our state machine and let the linker decide what to do
++        Calls.insert({std::to_string(-1), TYPE_SYSCALL, LineNumber});
++        // we couldn't get the actual value, but for our syscall offset calculation we still need a dummy value in our list == -1
++        I.getFunction()->getParent()->addSyscall(I.getFunction()->getName(), -1);
++      }
++    }
++  }
++}
++
++void CallHierarchy::addReferences(
++    Value *Op, SmallSetVector<const GlobalValue *, 8> &referencedFunctions,
++    ReachabilityResult* Res) {
++  SmallSetVector<const Value *, 8> visited;
++  addReferences(Op, referencedFunctions, visited, Res);
++}
++
++void CallHierarchy::addReferences(
++    Value *Op, SmallSetVector<const GlobalValue *, 8> &referencedFunctions,
++    SmallSetVector<const Value *, 8> &visited, ReachabilityResult* Res) {
++  Constant *C = dyn_cast<Constant>(Op);
++  if (!C || !visited.insert(Op))
++    return;
++
++  auto GV = dyn_cast<GlobalValue>(C);
++  if (GV && FunctionMapping.count(GV)) {
++    auto F = dyn_cast<Function>(GV);
++    if (F) {
++      referencedFunctions.insert(F);
++      
++      if (Res) {
++        Res->ArgumentReferences.insert(F->getName());
++      }
++    }
++    else {
++      auto* GA = dyn_cast<GlobalAlias>(GV);
++      referencedFunctions.insert(GA);
++      
++      if (Res) {
++        Res->ArgumentReferences.insert(GA->getName());
++      }
++    }
++    
++    return;
++  }
++
++  // Recurse into nested constants.
++  for (Value *Op : C->operand_values())
++    addReferences(Op, referencedFunctions, visited, Res);
++}
++
++AnalysisKey CallHierarchyAnalysis::Key;
++
++namespace llvm {
++namespace json {
++
++Object createCallGraphJSON(const std::string FunctionName,
++                           const CallHierarchy::ReachabilityResult &Res) {
++  auto GetName = [FunctionName](const BasicBlock* BB) {
++    std::string Str;
++    raw_string_ostream OS(Str);
++    
++    BB->printAsOperand(OS, false);
++    return FunctionName + "_" + OS.str();
++  };
++  
++  Object Transitions;
++  for (const auto& It : Res.Transitions) {
++    Array PossibleTransitions;
++    for (const auto& Transition : It.second) {
++      PossibleTransitions.push_back(GetName(Transition));
++    }
++  
++    Transitions[GetName(It.first)] = std::move(PossibleTransitions);
++  }
++  
++  Object BasicBlockCalls;
++  for (const auto& It : Res.BasicBlockCalls) {
++    Array Calls;
++    for (const auto& Call : It.second) {
++      Calls.push_back(Object{{"content", Call.Content},
++                             {"type", Call.Type},
++                             {"line", Call.LineNumber}});
++    }
++    
++    BasicBlockCalls[GetName(It.first)] = std::move(Calls);
++  }
++  
++  Object Root{{"transitions", std::move(Transitions)},
++              {"calls", std::move(BasicBlockCalls)},
++              {"start", Res.StartBB},
++              {"end", Res.EndBB}};
++  return Root;
++}
++
++Value toJSON(const CallHierarchy &Analysis) {
++  // Include an analysis result into the json only when it not contains any
++  // relevant data.
++  const bool InterestingOnly = true;
++
++  Array mappings;
++  for (auto &&Entry : Analysis.FunctionMapping) {
++    const GlobalValue *GV = Entry.first;
++    const CallHierarchy::ReachabilityResult &res = Entry.second;
++    if (Analysis.isExtern(GV) || (InterestingOnly && !res.isInteresting()))
++      continue;
++
++    Object Res{{"name", GV->getName()},
++               {"type", dump_function_type(Analysis.getType(GV))}};
++
++    if (res.CallTargets.size()) {
++      Array jsonArray;
++      for (const auto *T : res.CallTargets)
++        jsonArray.push_back(T->getName());
++      Res["call_targets"] = std::move(jsonArray);
++    }
++
++    if (res.IndirectCallTypes.size()) {
++      Array jsonArray;
++      for (const FunctionType *Type : res.IndirectCallTypes)
++        jsonArray.push_back(dump_function_type(Type));
++      Res["indirect_call_types"] = std::move(jsonArray);
++    }
++
++    if (res.ReferencedFunctions.size()) {
++      Array jsonArray;
++      for (const auto *T : res.ReferencedFunctions)
++        jsonArray.push_back(T->getName());
++      Res["referenced_functions"] = std::move(jsonArray);
++    }
++
++    if (res.SyscallNumbers.size()) {
++      Array jsonArray;
++      for (auto number : res.SyscallNumbers)
++        jsonArray.push_back(number);
++      Res["syscall_numbers"] = std::move(jsonArray);
++    }
++    
++    if (res.Alias.size()) {
++      Array jsonArray;
++      for (const auto& A : res.Alias)
++        jsonArray.push_back(A);
++      Res["alias"] = std::move(jsonArray);
++    }
++  
++    if (res.ArgumentReferences.size()) {
++      Array jsonArray;
++      for (const auto& A : res.ArgumentReferences)
++        jsonArray.push_back(A);
++      Res["argument_references"] = std::move(jsonArray);
++    }
++    
++    Res["call_graph"] = createCallGraphJSON(Entry.getFirst()->getName(), res);
++
++    mappings.push_back(std::move(Res));
++  }
++  Array addresses;
++  for (auto address : Analysis.HasAddressTaken) {
++    addresses.push_back(address->getName());
++  }
++  Object root{{"addresses_taken", std::move(addresses)},
++              {"functions", std::move(mappings)}};
++  
++  return root;
++}
++
++} // namespace json
++} // namespace llvm
++
++CallHierarchyPrinterPass::CallHierarchyPrinterPass(raw_ostream &OS) : OS(OS) {}
++
++PreservedAnalyses CallHierarchyPrinterPass::run(Module &M,
++                                                ModuleAnalysisManager &AM) {
++  CallHierarchy &CH = AM.getResult<CallHierarchyAnalysis>(M);
++  printCallHierarchy(OS, M, CH);
++  return PreservedAnalyses::all();
++}
++
++namespace {
++
++struct CallHierarchyPrinterLegacyPass : public ModulePass {
++  static char ID; // Pass ID, replacement for typeid
++
++  CallHierarchyPrinterLegacyPass() : ModulePass(ID) {
++    initializeCallGraphPrinterLegacyPassPass(*PassRegistry::getPassRegistry());
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++
++  bool runOnModule(Module &M) override {
++    CallHierarchy CH(M);
++
++    auto &OS = errs();
++    printCallHierarchy(OS, M, CH);
++    return false;
++  }
++};
++
++} // end anonymous namespace
++
++char CallHierarchyPrinterLegacyPass::ID = 0;
++
++INITIALIZE_PASS(CallHierarchyPrinterLegacyPass, "print-call-hierarchy",
++                "Print a call hierarchy", true, true)
+diff --git a/llvm/lib/Analysis/LazyCallGraph.cpp b/llvm/lib/Analysis/LazyCallGraph.cpp
+index 094079894c8..f7311b86622 100644
+--- a/llvm/lib/Analysis/LazyCallGraph.cpp
++++ b/llvm/lib/Analysis/LazyCallGraph.cpp
+@@ -99,14 +99,21 @@ LazyCallGraph::EdgeSequence &LazyCallGraph::Node::populateSlow() {
+   // safety of optimizing a direct call edge.
+   for (BasicBlock &BB : *F)
+     for (Instruction &I : BB) {
+-      if (auto CS = CallSite(&I))
+-        if (Function *Callee = CS.getCalledFunction())
+-          if (!Callee->isDeclaration())
++      if (auto CS = CallSite(&I)) {
++        if (Function *Callee = CS.getCalledFunction()) {
++          if (!G->SkipDeclarations || !Callee->isDeclaration())
+             if (Callees.insert(Callee).second) {
+               Visited.insert(Callee);
+               addEdge(Edges->Edges, Edges->EdgeIndexMap, G->get(*Callee),
+                       LazyCallGraph::Edge::Call);
+             }
++        } else {
++          // Track the signatures of the functions that are indirectly called.
++          PointerType* PT = cast<PointerType>(CS.getCalledValue()->getType());
++          FunctionType* FT = cast<FunctionType>(PT->getElementType());
++          IndirectCallSignatures.insert(FT);
++        }
++      }
+ 
+       for (Value *Op : I.operand_values())
+         if (Constant *C = dyn_cast<Constant>(Op))
+@@ -150,8 +157,9 @@ static bool isKnownLibFunction(Function &F, TargetLibraryInfo &TLI) {
+   return TLI.getLibFunc(F, LF) || TLI.isFunctionVectorizable(F.getName());
+ }
+ 
+-LazyCallGraph::LazyCallGraph(
+-    Module &M, function_ref<TargetLibraryInfo &(Function &)> GetTLI) {
++LazyCallGraph::LazyCallGraph(Module &M,
++  function_ref<TargetLibraryInfo &(Function &)> GetTLI, bool SkipDecls)
++    : SkipDeclarations(SkipDecls) {
+   LLVM_DEBUG(dbgs() << "Building CG for module: " << M.getModuleIdentifier()
+                     << "\n");
+   for (Function &F : M) {
+@@ -205,7 +213,8 @@ LazyCallGraph::LazyCallGraph(
+ 
+ LazyCallGraph::LazyCallGraph(LazyCallGraph &&G)
+     : BPA(std::move(G.BPA)), NodeMap(std::move(G.NodeMap)),
+-      EntryEdges(std::move(G.EntryEdges)), SCCBPA(std::move(G.SCCBPA)),
++      EntryEdges(std::move(G.EntryEdges)), SkipDeclarations(G.SkipDeclarations),
++      SCCBPA(std::move(G.SCCBPA)),
+       SCCMap(std::move(G.SCCMap)),
+       LibFunctions(std::move(G.LibFunctions)) {
+   updateGraphPtrs();
+@@ -215,6 +224,7 @@ LazyCallGraph &LazyCallGraph::operator=(LazyCallGraph &&G) {
+   BPA = std::move(G.BPA);
+   NodeMap = std::move(G.NodeMap);
+   EntryEdges = std::move(G.EntryEdges);
++  SkipDeclarations = G.SkipDeclarations;
+   SCCBPA = std::move(G.SCCBPA);
+   SCCMap = std::move(G.SCCMap);
+   LibFunctions = std::move(G.LibFunctions);
+diff --git a/llvm/lib/CodeGen/MachineBlockPlacement.cpp b/llvm/lib/CodeGen/MachineBlockPlacement.cpp
+index 30b98ec88c2..2711b203ac4 100644
+--- a/llvm/lib/CodeGen/MachineBlockPlacement.cpp
++++ b/llvm/lib/CodeGen/MachineBlockPlacement.cpp
+@@ -164,7 +164,7 @@ static cl::opt<unsigned> TailDupPlacementAggressiveThreshold(
+     "tail-dup-placement-aggressive-threshold",
+     cl::desc("Instruction cutoff for aggressive tail duplication during "
+              "layout. Used at -O3. Tail merging during layout is forced to "
+-             "have a threshold that won't conflict."), cl::init(4),
++             "have a threshold that won't conflict."), cl::init(0), // setting this to 0 from 4 as it messes up our syscall state machine and syscall offsets as it sometimes duplicates syscall instructions after we generated our information
+     cl::Hidden);
+ 
+ // Heuristic for tail duplication.
+diff --git a/llvm/lib/CodeGen/MachineFunction.cpp b/llvm/lib/CodeGen/MachineFunction.cpp
+index 4612690644f..95d0b8a99d5 100644
+--- a/llvm/lib/CodeGen/MachineFunction.cpp
++++ b/llvm/lib/CodeGen/MachineFunction.cpp
+@@ -654,6 +654,17 @@ MCSymbol *MachineFunction::getPICBaseSymbol() const {
+                                Twine(getFunctionNumber()) + "$pb");
+ }
+ 
++MCSymbol *MachineFunction::getPICBaseSymbolSyscallOffset(std::string &name, int &syscall_number, size_t &number_of_syscall) const {
++  const DataLayout &DL = getDataLayout();
++  // emitting it with the PrivateGlobalPrefix in front prevents our symbol from being emitted to object file
++  return Ctx.getOrCreateSymbol(Twine(DL.getPrivateGlobalPrefix()) +
++                               Twine("-Syscall-") + Twine(name) + "-" +
++                               Twine("Number") + "-" + Twine(syscall_number) + "-" +
++                               Twine(getFunctionNumber()) + "-" +
++                               Twine(number_of_syscall) + "-" +
++                               "$pb");
++}
++
+ /// \name Exception Handling
+ /// \{
+ 
+diff --git a/llvm/lib/MC/ELFObjectWriter.cpp b/llvm/lib/MC/ELFObjectWriter.cpp
+index 6b4b45eb8ef..e788100ef28 100644
+--- a/llvm/lib/MC/ELFObjectWriter.cpp
++++ b/llvm/lib/MC/ELFObjectWriter.cpp
+@@ -50,6 +50,8 @@
+ #include "llvm/Support/StringSaver.h"
+ #include "llvm/Support/SwapByteOrder.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/FormatVariadic.h"
+ #include <algorithm>
+ #include <cassert>
+ #include <cstddef>
+@@ -59,6 +61,7 @@
+ #include <string>
+ #include <utility>
+ #include <vector>
++#include <regex>
+ 
+ using namespace llvm;
+ 
+@@ -1069,6 +1072,7 @@ void ELFWriter::writeSectionHeader(
+ uint64_t ELFWriter::writeObject(MCAssembler &Asm, const MCAsmLayout &Layout) {
+   uint64_t StartOffset = W.OS.tell();
+ 
++  
+   MCContext &Ctx = Asm.getContext();
+   MCSectionELF *StrtabSection =
+       Ctx.getELFSection(".strtab", ELF::SHT_STRTAB, 0);
+@@ -1173,6 +1177,115 @@ uint64_t ELFWriter::writeObject(MCAssembler &Asm, const MCAsmLayout &Layout) {
+     computeSymbolTable(Asm, Layout, SectionIndexMap, RevGroupMap,
+                        SectionOffsets);
+ 
++    // we have calculated the symbol table, so now we can extract the syscall offsets
++    // from the private label we added in our machine function pass
++
++    // map function names to syscall numbers, which are mapped to the offsets at which the specific syscall can occur
++    std::map<std::string, std::map<int, std::vector<int>>> syscall_offsets;
++    // map function names to syscall offsets where we don't know the syscall number
++    std::map<std::string, std::vector<int>> unknown_syscalls_per_offset;
++    // map functions to syscall numbers where we don't know the offset yet, ie., these are external calls to one of our syscall functions (syscall(), __syscall_cp(), syscall_cp_c(), sccp())
++    // the linker will merge them with the correct info
++    std::map<std::string, std::vector<int>> syscalls_to_unknown_offsets;
++    for(auto sym=Asm.symbol_begin(); sym!=Asm.symbol_end(); sym++) {
++      if(sym->getName().contains("Syscall")) {
++        // llvm::errs() << "symbol name: " << sym->getName() << "\n";
++        std::string function_name;
++        int syscall_nr = -1;
++        std::regex regex("Syscall-([a-zA-Z_0-9]*)-Number-([0-9]*)");
++        std::smatch sm;
++        // regex_search somehow no longer allows for temporary strings, hence we need to assign it to a local variable
++        std::string data = sym->getName().str();
++        if (regex_search(data,sm,regex)) {
++          if (sm.size() == 3) {
++            function_name = sm[1];
++            // we have cases where we need to get the function name but where no syscall number exists, eg., syscall(), __syscall_cp_c(). Need to treat them separately here
++            if(sm[2] != "")
++              syscall_nr = std::stoi(sm[2]);
++          } else {
++            llvm::errs() << "Couldn't find function name and syscall number in " << sym->getName() << "\n";
++            continue;
++          }
++        }
++
++        // this only gets us the offset in the whole file, not relative to the function start
++        // so let's grab the symbol for the function and calculate the offset
++        // this is inefficient, but it works for now
++        uint64_t syscall_val = -1;
++        uint64_t function_val = -1;
++        Layout.getSymbolOffset(*sym, syscall_val);
++        for(auto sym=Asm.symbol_begin(); sym!=Asm.symbol_end(); sym++) {
++          if(sym->getName() == function_name) {
++            Layout.getSymbolOffset(*sym, function_val);
++            break;
++          }
++        }
++        // in this case we are looking for an inline assembly syscall in our current function
++        // if syscall_nr is -1, then we are actually parsing our syscall functions.
++        // The -1 is ok in this case, the linker will handle the rest
++        if(function_val != -1ul) {
++          if(syscall_nr == -1)
++            unknown_syscalls_per_offset[function_name].push_back(syscall_val - function_val);
++          else
++            syscall_offsets[function_name][syscall_nr].push_back(syscall_val - function_val);
++        }
++        else // in this case, we have a call to one of our syscall functions, so here we know the syscall number but not the offset.
++          syscalls_to_unknown_offsets[function_name].push_back(syscall_nr);
++      }
++    }
++    // we have some syscall offsets, so let us emit them
++    if(syscall_offsets.size() || unknown_syscalls_per_offset.size() || syscalls_to_unknown_offsets.size()) {
++      json::Object Functions;
++      for (const auto &Entry : syscall_offsets) {
++        json::Object Syscalls;
++        for (const auto &sys_nr : Entry.second) {
++          json::Array offsets;
++          for (const auto& offset : sys_nr.second) {
++            // offsets.push_back(std::to_string(offset));
++            offsets.push_back(offset);
++          }
++          Syscalls[std::to_string(sys_nr.first)] = std::move(offsets);
++        }
++        Functions[Entry.first] = std::move(Syscalls);
++      }
++
++      json::Object UnknownSyscallsPerOffset;
++      for (const auto &Entry : unknown_syscalls_per_offset) {
++        json::Array offsets;
++        for (const auto &offset : Entry.second) {
++          offsets.push_back(offset);
++        }
++        UnknownSyscallsPerOffset[Entry.first] = std::move(offsets);
++      }
++
++      json::Object SyscallsToUnknownOffsets;
++      for (const auto &Entry : syscalls_to_unknown_offsets) {
++        json::Array syscalls;
++        for (const auto syscall : Entry.second) {
++          syscalls.push_back(syscall);
++        }
++        SyscallsToUnknownOffsets[Entry.first] = std::move(syscalls);
++      }
++
++      json::Value json = json::Object{{"functions", std::move(Functions)},
++                                      {"unknown_syscalls_per_offset", std::move(UnknownSyscallsPerOffset)},
++                                      {"syscalls_to_unknown_offsets", std::move(SyscallsToUnknownOffsets)}};
++      std::string json_data = formatv("{0}", json).str();
++      std::string json_data_with_length = formatv("{length:{0}}{1}", std::to_string(json_data.length()), json_data);
++      // llvm::errs() << "json: " << json_data_with_length << "\n";
++
++      MCSectionELF *SyscallOffsetSection;
++      SyscallOffsetSection = Ctx.getELFSection(".syscall_offsets", ELF::SHT_PROGBITS,
++                                         ELF::SHT_NOTE);
++      SectionIndexMap[SyscallOffsetSection] = addToSectionTable(SyscallOffsetSection);
++
++      uint64_t SecStart = W.OS.tell();
++      W.OS << json_data_with_length;
++
++      uint64_t SecEnd = W.OS.tell();
++      SectionOffsets[SyscallOffsetSection] = std::make_pair(SecStart, SecEnd);
++    }
++
+     for (MCSectionELF *RelSection : Relocations) {
+       align(RelSection->getAlignment());
+ 
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index d567cc14a83..d524a37cb94 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -489,6 +489,9 @@ void MCObjectFileInfo::initELFMCObjectFileInfo(const Triple &T, bool Large) {
+       Ctx->getELFSection(".eh_frame", EHSectionType, EHSectionFlags);
+ 
+   StackSizesSection = Ctx->getELFSection(".stack_sizes", ELF::SHT_PROGBITS, 0);
++
++  AssemblySyscallsSection =
++      Ctx->getELFSection(".assembly_syscalls", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+ }
+ 
+ void MCObjectFileInfo::initCOFFMCObjectFileInfo(const Triple &T) {
+diff --git a/llvm/lib/MC/MCParser/AsmParser.cpp b/llvm/lib/MC/MCParser/AsmParser.cpp
+index 94a44c1f93b..0bbe242d821 100644
+--- a/llvm/lib/MC/MCParser/AsmParser.cpp
++++ b/llvm/lib/MC/MCParser/AsmParser.cpp
+@@ -56,6 +56,7 @@
+ #include "llvm/Support/SMLoc.h"
+ #include "llvm/Support/SourceMgr.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/AsmParser/AssemblySyscall.h"
+ #include <algorithm>
+ #include <cassert>
+ #include <cctype>
+@@ -953,6 +954,21 @@ bool AsmParser::Run(bool NoInitialTextSection, bool NoFinalize) {
+       ++Index;
+     }
+   }
++  
++  // Add all syscalls which were called from assembly directly
++  const auto SyscallJSON = AssemblySyscall::getInstance().toJSON();
++  if (AssemblySyscall::getInstance().hasContent()) {
++    std::string json_data = formatv("{0}", SyscallJSON).str();
++    std::string json_data_with_length = formatv("{length:{0}}{1}", std::to_string(json_data.length()), json_data);
++    
++    auto* CurrentSection = getStreamer().getCurrentSectionOnly();
++    
++    getStreamer().SwitchSection(
++        getContext().getObjectFileInfo()->getAssemblySyscallsSection());
++    getStreamer().EmitBytes(json_data_with_length);
++  
++    getStreamer().SwitchSection(CurrentSection);
++  }
+ 
+   // Check to see that all assembler local symbols were actually defined.
+   // Targets that don't do subsections via symbols may not want this, though,
+@@ -985,7 +1001,7 @@ bool AsmParser::Run(bool NoInitialTextSection, bool NoFinalize) {
+       }
+     }
+   }
+-
++  
+   // Finalize the output stream if there are no errors and if the client wants
+   // us to.
+   if (!HadError && !NoFinalize)
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index 53b7db8689c..0be2a69550c 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -27,6 +27,7 @@
+ #include "llvm/Analysis/CFLSteensAliasAnalysis.h"
+ #include "llvm/Analysis/CGSCCPassManager.h"
+ #include "llvm/Analysis/CallGraph.h"
++#include "llvm/Analysis/CallHierarchyAnalysis.h"
+ #include "llvm/Analysis/DDG.h"
+ #include "llvm/Analysis/DemandedBits.h"
+ #include "llvm/Analysis/DependenceAnalysis.h"
+@@ -97,6 +98,7 @@
+ #include "llvm/Transforms/Instrumentation.h"
+ #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
+ #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
++#include "llvm/Transforms/Instrumentation/CallHierarchy.h"
+ #include "llvm/Transforms/Instrumentation/CGProfile.h"
+ #include "llvm/Transforms/Instrumentation/ControlHeightReduction.h"
+ #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 355dd6f9681..ade89ab52eb 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -7,7 +7,7 @@
+ //===----------------------------------------------------------------------===//
+ //
+ // This file is used as the registry of passes that are part of the core LLVM
+-// libraries. This file describes both transformation passes and analyses
++// libraries. This file describes both transformation passes and analyses.
+ // Analyses are registered while transformation passes have names registered
+ // that can be used when providing a textual pass pipeline.
+ //
+@@ -19,6 +19,7 @@
+ #define MODULE_ANALYSIS(NAME, CREATE_PASS)
+ #endif
+ MODULE_ANALYSIS("callgraph", CallGraphAnalysis())
++MODULE_ANALYSIS("callhierarchy", CallHierarchyAnalysis())
+ MODULE_ANALYSIS("lcg", LazyCallGraphAnalysis())
+ MODULE_ANALYSIS("module-summary", ModuleSummaryIndexAnalysis())
+ MODULE_ANALYSIS("no-op-module", NoOpModuleAnalysis())
+@@ -48,6 +49,7 @@ MODULE_PASS("constmerge", ConstantMergePass())
+ MODULE_PASS("cross-dso-cfi", CrossDSOCFIPass())
+ MODULE_PASS("deadargelim", DeadArgumentEliminationPass())
+ MODULE_PASS("elim-avail-extern", EliminateAvailableExternallyPass())
++MODULE_PASS("embed-callhierarchy", CallHierarchyPass())
+ MODULE_PASS("forceattrs", ForceFunctionAttrsPass())
+ MODULE_PASS("function-import", FunctionImportPass())
+ MODULE_PASS("globaldce", GlobalDCEPass())
+@@ -76,6 +78,7 @@ MODULE_PASS("print-profile-summary", ProfileSummaryPrinterPass(dbgs()))
+ MODULE_PASS("print-callgraph", CallGraphPrinterPass(dbgs()))
+ MODULE_PASS("print", PrintModulePass(dbgs()))
+ MODULE_PASS("print-lcg", LazyCallGraphPrinterPass(dbgs()))
++MODULE_PASS("print-callhierarchy", CallHierarchyPrinterPass(dbgs()))
+ MODULE_PASS("print-lcg-dot", LazyCallGraphDOTPrinterPass(dbgs()))
+ MODULE_PASS("print-stack-safety", StackSafetyGlobalPrinterPass(dbgs()))
+ MODULE_PASS("rewrite-statepoints-for-gc", RewriteStatepointsForGC())
+diff --git a/llvm/lib/Target/X86/AsmParser/X86AsmParser.cpp b/llvm/lib/Target/X86/AsmParser/X86AsmParser.cpp
+index d37d812df48..fd6d5d1ab50 100644
+--- a/llvm/lib/Target/X86/AsmParser/X86AsmParser.cpp
++++ b/llvm/lib/Target/X86/AsmParser/X86AsmParser.cpp
+@@ -34,8 +34,10 @@
+ #include "llvm/Support/SourceMgr.h"
+ #include "llvm/Support/TargetRegistry.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/AsmParser/AssemblySyscall.h"
+ #include <algorithm>
+ #include <memory>
++#include <set>
+ 
+ using namespace llvm;
+ 
+@@ -71,6 +73,16 @@ static const char OpPrecedence[] = {
+ class X86AsmParser : public MCTargetAsmParser {
+   ParseInstructionInfo *InstInfo;
+   bool Code16GCC;
++  
++  // Assembly Syscall tracking
++  int64_t SyscallNumber{};
++  MCSymbol* CurrentLabel;
++  MCSymbol *function_label = nullptr;
++  
++  // Call graph creation
++  int64_t BasicBlockCounter{};
++  std::string CurrentBasicBlock = std::to_string(BasicBlockCounter);
++  std::string LastInstruction;
+ 
+   enum VEXEncoding {
+     VEXEncoding_Default,
+@@ -995,6 +1007,8 @@ private:
+   bool isParsingIntelSyntax() {
+     return getParser().getAssemblerDialect();
+   }
++  
++  void doBeforeLabelEmit(MCSymbol *Symbol) override;
+ 
+   /// @name Auto-generated Matcher Functions
+   /// {
+@@ -2923,6 +2937,93 @@ bool X86AsmParser::ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
+       static_cast<X86Operand &>(*Operands[0]).setTokenValue("xlatb");
+     }
+   }
++  
++  /**
++   * START: Track assembly syscalls
++   */
++  if ((Name == "mov" || Name == "movw" || Name == "movl")
++      && Operands.size() == 3) {
++    
++    const auto* Value = static_cast<X86Operand*>(Operands[1].get());
++    const auto* Register = static_cast<X86Operand*>(Operands[2].get());
++    
++    if (Value->isImm() && Register->isReg()) {
++      if (Register->getReg() == X86::AL  || Register->getReg() == X86::AX ||
++          Register->getReg() == X86::EAX || Register->getReg() == X86::RAX) {
++        Value->Imm.Val->evaluateAsAbsolute(SyscallNumber);
++      }
++    }
++  }
++  
++  if (!isParsingInlineAsm() && SyscallNumber > 0) {
++    std::string Label = CurrentLabel ? CurrentLabel->getName() : "";
++    
++    if (Name == "int" && Operands.size() == 2) {
++      const auto* Interrupt = static_cast<X86Operand*>(Operands[1].get());
++    
++      if (Interrupt->isImm()) {
++        int64_t Value{};
++        Interrupt->Imm.Val->evaluateAsAbsolute(Value);
++      
++        if (Value == 0x80) {
++          const auto Line = getSourceManager().FindLineNumber(NameLoc);
++          AssemblySyscall::getInstance().addSyscall(Label, SyscallNumber,
++                                                    CurrentBasicBlock, Line);
++        }
++      }
++    }
++  
++    if (Name == "syscall" && Operands.size() == 1) {
++      const auto Line = getSourceManager().FindLineNumber(NameLoc);
++      AssemblySyscall::getInstance().addSyscall(Label, SyscallNumber,
++                                                CurrentBasicBlock, Line);
++    }
++  } else {
++    std::string Label = function_label ? function_label->getName() : "";
++    if (Name == "syscall" && Operands.size() == 1) {
++      const auto Line = getSourceManager().FindLineNumber(NameLoc);
++      AssemblySyscall::getInstance().addSyscall(Label, -1,
++                                                CurrentBasicBlock, Line);
++    }
++  }
++  /**
++   * END: Track assembly syscalls
++   */
++   
++  /**
++   * START: Create call graph
++   */
++  // If we encounter a jump, a new basic block starts
++  if (Name == "jmp" || Name == "je" || Name == "jne"
++      || Name == "jz" || Name == "jnz") {
++    // First add the possible transition if the jump condition is not met
++    // => just go to the next basic block
++    // Important: Dont do it for simple jump as this has no condition
++    if (Name != "jmp") {
++      BasicBlockCounter++;
++      AssemblySyscall::getInstance()
++          .addTransition(CurrentBasicBlock, std::to_string(BasicBlockCounter));
++    }
++    
++    // Then, try to get the possible symbol where the condition can jump and
++    // also add that to the transition
++    if (Operands.size() == 2) {
++      const auto* Symbol = static_cast<X86Operand*>(Operands[1].get());
++      if (Symbol->isMem()) {
++        std::string Str;
++        raw_string_ostream OS(Str);
++        
++        Symbol->Mem.Disp->print(OS, nullptr);
++  
++        AssemblySyscall::getInstance()
++            .addTransition(CurrentBasicBlock, OS.str());
++      }
++    }
++    
++    CurrentBasicBlock = std::to_string(BasicBlockCounter);
++  }
++  
++  LastInstruction = Name;
+ 
+   if (Flags)
+     Operands.push_back(X86Operand::CreatePrefix(Flags, NameLoc, NameLoc));
+@@ -3239,8 +3340,23 @@ bool X86AsmParser::MatchAndEmitATTInstruction(SMLoc IDLoc, unsigned &Opcode,
+         ;
+ 
+     Inst.setLoc(IDLoc);
+-    if (!MatchingInlineAsm)
++    if (!MatchingInlineAsm) {
++      if(Inst.getOpcode() == X86::SYSCALL) {
++        auto last_syscall = AssemblySyscall::getInstance().getLastAssemblyCallSite();
++        if(last_syscall) {
++          Twine label_name = Twine(".L") + // should denote a private label, so it does not get emitted. There's probably a way to get this dynamically
++                            Twine("-Syscall-") + Twine(last_syscall->Label) +
++                            Twine("-Number-") + Twine(last_syscall->Syscall) +
++                            Twine("-0-") +
++                            Twine(rand()) + // just add a random number, don't care about it. It's just so that we don't get a duplicated label
++                            "-$pb";
++
++          MCSymbol *sym = getContext().getOrCreateSymbol(label_name);
++          Out.EmitLabel(sym);
++        }
++      }
+       EmitInstruction(Inst, Operands, Out);
++    }
+     Opcode = Inst.getOpcode();
+     return false;
+   case Match_InvalidImmUnsignedi4: {
+@@ -3561,8 +3677,23 @@ bool X86AsmParser::MatchAndEmitIntelInstruction(SMLoc IDLoc, unsigned &Opcode,
+       while (processInstruction(Inst, Operands))
+         ;
+     Inst.setLoc(IDLoc);
+-    if (!MatchingInlineAsm)
++    if (!MatchingInlineAsm) {
++      if(Inst.getOpcode() == X86::SYSCALL) {
++        auto last_syscall = AssemblySyscall::getInstance().getLastAssemblyCallSite();
++        if(last_syscall) {
++          Twine label_name = Twine(".L") + // should denote a private label, so it does not get emitted. There's probably a way to get this dynamically
++                            Twine("-Syscall-") + Twine(last_syscall->Label) +
++                            Twine("-Number-") + Twine(last_syscall->Syscall) +
++                            Twine("-0-") +
++                            Twine(rand()) + // just add a random number, don't care about it. It's just so that we don't get a duplicated label
++                            "-$pb";
++
++          MCSymbol *sym = getContext().getOrCreateSymbol(label_name);
++          Out.EmitLabel(sym);
++        }
++      }
+       EmitInstruction(Inst, Operands, Out);
++    }
+     Opcode = Inst.getOpcode();
+     return false;
+   } else if (NumSuccessfulMatches > 1) {
+@@ -3938,6 +4069,25 @@ bool X86AsmParser::parseDirectiveSEHPushFrame(SMLoc Loc) {
+   return false;
+ }
+ 
++void X86AsmParser::doBeforeLabelEmit(MCSymbol *Symbol) {
++  CurrentLabel = Symbol;
++
++  if (!function_label)
++    function_label = Symbol;
++  
++  // If the symbol has switched, we also have a possible transition from the
++  // current basic block to the new one
++  // IMPORTANT: Dont do this if the last instruction was jmp as then,
++  // we already added the correct transition
++  if (LastInstruction != "jmp") {
++    AssemblySyscall::getInstance().addTransition(CurrentBasicBlock,
++                                                 CurrentLabel->getName());
++  }
++  
++  // Also if a new symbol starts, a new basic block starts
++  CurrentBasicBlock = CurrentLabel->getName();
++}
++
+ // Force static initialization.
+ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86AsmParser() {
+   RegisterMCAsmParser<X86AsmParser> X(getTheX86_32Target());
+diff --git a/llvm/lib/Target/X86/CMakeLists.txt b/llvm/lib/Target/X86/CMakeLists.txt
+index 58f2292dd4c..299de15421c 100644
+--- a/llvm/lib/Target/X86/CMakeLists.txt
++++ b/llvm/lib/Target/X86/CMakeLists.txt
+@@ -69,6 +69,7 @@ set(sources
+   X86VZeroUpper.cpp
+   X86WinAllocaExpander.cpp
+   X86WinEHState.cpp
++  X86SyscallOffset.cpp
+   )
+ 
+ add_llvm_target(X86CodeGen ${sources})
+diff --git a/llvm/lib/Target/X86/X86.h b/llvm/lib/Target/X86/X86.h
+index 0481a40d462..1003a66f346 100644
+--- a/llvm/lib/Target/X86/X86.h
++++ b/llvm/lib/Target/X86/X86.h
+@@ -129,6 +129,9 @@ FunctionPass *createX86DiscriminateMemOpsPass();
+ /// This pass applies profiling information to insert cache prefetches.
+ FunctionPass *createX86InsertPrefetchPass();
+ 
++/// This pass adds labels before syscall instructions.
++FunctionPass *createX86SyscallOffsetPass();
++
+ InstructionSelector *createX86InstructionSelector(const X86TargetMachine &TM,
+                                                   X86Subtarget &,
+                                                   X86RegisterBankInfo &);
+@@ -150,6 +153,7 @@ void initializeX86ExpandPseudoPass(PassRegistry &);
+ void initializeX86FlagsCopyLoweringPassPass(PassRegistry &);
+ void initializeX86OptimizeLEAPassPass(PassRegistry &);
+ void initializeX86SpeculativeLoadHardeningPassPass(PassRegistry &);
++void initializeX86SyscallOffsetPassPass(PassRegistry &);
+ 
+ namespace X86AS {
+ enum : unsigned {
+diff --git a/llvm/lib/Target/X86/X86AsmPrinter.h b/llvm/lib/Target/X86/X86AsmPrinter.h
+index ee79401dc80..4cad3d5a443 100644
+--- a/llvm/lib/Target/X86/X86AsmPrinter.h
++++ b/llvm/lib/Target/X86/X86AsmPrinter.h
+@@ -15,6 +15,8 @@
+ #include "llvm/CodeGen/StackMaps.h"
+ #include "llvm/MC/MCCodeEmitter.h"
+ #include "llvm/Target/TargetMachine.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCObjectFileInfo.h"
+ 
+ // Implemented in X86MCInstLower.cpp
+ namespace {
+diff --git a/llvm/lib/Target/X86/X86SyscallOffset.cpp b/llvm/lib/Target/X86/X86SyscallOffset.cpp
+new file mode 100644
+index 00000000000..24e6517c515
+--- /dev/null
++++ b/llvm/lib/Target/X86/X86SyscallOffset.cpp
+@@ -0,0 +1,150 @@
++//===-- X86SyscallOffset.cpp - Syscall Offset Label Emitter for x86 --==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++///
++/// Description: This pass is responsible for emitting a pre-instruction symbol
++/// on syscall instructions.
++///
++//===----------------------------------------------------------------------===//
++
++#include "X86.h"
++#include "X86InstrBuilder.h"
++#include "X86Subtarget.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineOperand.h"
++#include "llvm/MC/MCCodeEmitter.h"
++#include "llvm/IR/Function.h"
++#include "llvm/Support/Debug.h"
++#include <bitset>
++#include <string>
++
++using namespace llvm;
++
++#define PASS_KEY "syscall-offset"
++#define DEBUG_TYPE PASS_KEY
++static cl::opt<bool> EnableSyscallOffset(
++    "x86-syscall-offset", cl::NotHidden,
++    cl::desc("X86: Enable syscall offset label emitter in the backend."), cl::init(false));
++
++
++STATISTIC(NumLabelsEmitted, "Number of labels added for syscall instructions");
++STATISTIC(NumFunctionsConsidered, "Number of functions analyzed");
++
++namespace {
++
++class X86SyscallOffsetPass : public MachineFunctionPass {
++public:
++  X86SyscallOffsetPass() : MachineFunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "X86 Syscall Offset Label Emitter";
++  }
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  static char ID;
++};
++
++} // end anonymous namespace
++
++char X86SyscallOffsetPass::ID = 0;
++
++std::map<std::string, std::deque<int>> syscall_mapping;
++
++std::deque<int> *getSyscalls(std::string func_name) {
++  auto syscalls_iter = syscall_mapping.find(func_name);
++  if(syscalls_iter != syscall_mapping.end())
++    return &syscalls_iter->second;
++
++  return nullptr;
++}
++
++void addLabel(MachineBasicBlock::iterator &MI, MachineFunction &MF, std::string name, int syscall_number, size_t &number_of_syscall) {
++  MI->setPreInstrSymbol(MF, MF.getPICBaseSymbolSyscallOffset(name, syscall_number, ++number_of_syscall));
++  NumLabelsEmitted++;
++}
++
++void emitLabel(const Function &F, MachineFunction &MF) {
++  size_t number_of_syscall = 0;
++  // for each machine basic block
++  for (auto &MBB : MF) {
++    if (MBB.empty())
++      continue;
++
++    // for each machine instruction
++    for (auto MI=MBB.begin(); MI!=MBB.end(); ++MI) {
++      // check the op code
++      if (MI->getOpcode() == X86::SYSCALL) {
++        auto syscalls = getSyscalls(MF.getName());
++        if(syscalls && syscalls->size()) {
++          addLabel(MI, MF, MF.getName(), syscalls->front(), number_of_syscall);
++          syscalls->pop_front();
++        } else
++          addLabel(MI, MF, MF.getName(), -1, number_of_syscall);
++      } else if (MI->isInlineAsm()) {
++        // copy paste from somewhere, to get the asm string
++        // Count the number of register definitions to find the asm string.
++        unsigned NumDefs = 0;
++        for (; MI->getOperand(NumDefs).isReg() && MI->getOperand(NumDefs).isDef();
++            ++NumDefs)
++        assert(NumDefs != MI->getNumOperands()-2 && "No asm string?");
++        assert(MI->getOperand(NumDefs).isSymbol() && "No asm string?");
++
++        std::string str{ MI->getOperand(NumDefs).getSymbolName() };
++        if (str == "syscall") {
++          auto syscalls = getSyscalls(MF.getName());
++          if(syscalls && syscalls->size()) {
++            addLabel(MI, MF, MF.getName(), syscalls->front(), number_of_syscall);
++            syscalls->pop_front();
++          } else
++            addLabel(MI, MF, MF.getName(), -1, number_of_syscall);
++        }
++      } else if (MI->isCall()) {
++        for (auto operand : MI->operands()) {
++          if (operand.isGlobal() && (operand.getGlobal()->getName() == "__syscall_cp"
++                                  // || operand.getGlobal()->getName() == "__syscall_cp_c"
++                                  || operand.getGlobal()->getName() == "syscall") && MF.getName() != operand.getGlobal()->getName()) {
++            auto syscalls = getSyscalls(operand.getGlobal()->getName());
++            if(syscalls && syscalls->size()) {
++              addLabel(MI, MF, operand.getGlobal()->getName(), syscalls->front(), number_of_syscall);
++              syscalls->pop_front();
++              break;
++            }
++          }
++        }
++      }
++    } // end of for each MI
++  } // end of for each MBB
++}
++
++bool X86SyscallOffsetPass::runOnMachineFunction(
++    MachineFunction &MF) {
++  if (!EnableSyscallOffset)
++    return false;
++  LLVM_DEBUG(dbgs() << "***** " << getPassName() << " : " << MF.getName()
++                    << " *****\n");
++  // Don't skip functions with the "optnone" attr but participate in opt-bisect.
++  // skip functions that don't contain a syscall
++  const Function &F = MF.getFunction();
++  syscall_mapping = F.getParent()->getSyscallMapping();
++  if ((!F.hasOptNone() && skipFunction(F)))
++    return false;
++  ++NumFunctionsConsidered;
++
++  emitLabel(F, MF);
++
++  return true;
++}
++
++INITIALIZE_PASS(X86SyscallOffsetPass, PASS_KEY,
++                "X86 Syscall Offset Label Emitter", false, false)
++
++FunctionPass *llvm::createX86SyscallOffsetPass() {
++  return new X86SyscallOffsetPass();
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/X86/X86TargetMachine.cpp b/llvm/lib/Target/X86/X86TargetMachine.cpp
+index 8c696e9adbe..77226982802 100644
+--- a/llvm/lib/Target/X86/X86TargetMachine.cpp
++++ b/llvm/lib/Target/X86/X86TargetMachine.cpp
+@@ -83,6 +83,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86Target() {
+   initializeX86FlagsCopyLoweringPassPass(PR);
+   initializeX86CondBrFoldingPassPass(PR);
+   initializeX86OptimizeLEAPassPass(PR);
++  initializeX86SyscallOffsetPassPass(PR);
+ }
+ 
+ static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
+@@ -542,6 +543,8 @@ void X86PassConfig::addPreEmitPass2() {
+   // Identify valid longjmp targets for Windows Control Flow Guard.
+   if (TT.isOSWindows())
+     addPass(createCFGuardLongjmpPass());
++
++  addPass(createX86SyscallOffsetPass());
+ }
+ 
+ std::unique_ptr<CSEConfigBase> X86PassConfig::getCSEConfig() const {
+diff --git a/llvm/lib/Transforms/Instrumentation/CMakeLists.txt b/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
+index 9316de4eb32..f52ec2b10f7 100644
+--- a/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
++++ b/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ add_llvm_component_library(LLVMInstrumentation
+   AddressSanitizer.cpp
+   BoundsChecking.cpp
++  CallHierarchy.cpp
+   CGProfile.cpp
+   ControlHeightReduction.cpp
+   DataFlowSanitizer.cpp
+diff --git a/llvm/lib/Transforms/Instrumentation/CallHierarchy.cpp b/llvm/lib/Transforms/Instrumentation/CallHierarchy.cpp
+new file mode 100644
+index 00000000000..7b6354fbd60
+--- /dev/null
++++ b/llvm/lib/Transforms/Instrumentation/CallHierarchy.cpp
+@@ -0,0 +1,80 @@
++#include "llvm/Transforms/Instrumentation/CallHierarchy.h"
++
++#include "llvm/Analysis/CallHierarchyAnalysis.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Type.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++using namespace llvm;
++
++namespace {
++Constant *getAlignedStringConstant(LLVMContext &Context, StringRef Str,
++                                   uint64_t Alignment) {
++  SmallVector<uint8_t, 64> ElementVals;
++  ElementVals.append(Str.begin(), Str.end());
++  ElementVals.push_back(0);
++  uint64_t end = alignTo(Str.size() + 1, Alignment);
++  for (uint64_t i = Str.size() + 1; i < end; ++i)
++    ElementVals.push_back(0);
++  return ConstantDataArray::get(Context, ElementVals);
++}
++} // namespace
++
++CallHierarchyPass::CallHierarchyPass() {}
++
++PreservedAnalyses CallHierarchyPass::run(Module &M, ModuleAnalysisManager &AM) {
++  if (M.getFunctionList().empty())
++    return PreservedAnalyses::all();
++
++  CallHierarchy &CH = AM.getResult<CallHierarchyAnalysis>(M);
++
++  // serialize the analysis result as json
++  std::string JsonData = formatv("{0}", json::toJSON(CH)).str(); // 0:2
++  /* errs() << JsonData << "\n\n"; */
++
++  std::string Name = "SFIP";
++  uint64_t NoteType = 0x400;
++
++  LLVMContext &Ctx = M.getContext();
++  IntegerType *Int32 = Type::getInt32Ty(Ctx);
++
++  // Type definition and constant initialization for a note header.
++  StructType *ElfHdrType = StructType::get(Ctx, {Int32, Int32, Int32});
++
++  Constant *NameSzConstant =
++      ConstantInt::get(Ctx, APInt(32, Name.length() + 1));
++  Constant *DescSzConstant =
++      ConstantInt::get(Ctx, APInt(32, JsonData.length() + 1));
++  Constant *TypeConstant = ConstantInt::get(Ctx, APInt(32, NoteType));
++  Constant *ElfHdrConstant = ConstantStruct::get(ElfHdrType, NameSzConstant,
++                                                 DescSzConstant, TypeConstant);
++
++  // Type definitions for constant initializing a note entry.
++  Constant *NameConstant = getAlignedStringConstant(Ctx, Name, 4);
++  Constant *DescConstant = getAlignedStringConstant(Ctx, JsonData, 4);
++  /* errs() << "Test: "; */
++  /* DescConstant->print(errs(), false); */
++  /* errs() << "\n"; */
++
++  StructType *ElfNoteType = StructType::get(
++      Ctx, {ElfHdrType, NameConstant->getType(), DescConstant->getType()});
++  Constant *ElfNoteConstant = ConstantStruct::get(ElfNoteType, ElfHdrConstant,
++                                                  NameConstant, DescConstant);
++
++  // Create the note variable and mark it as used
++  GlobalVariable *NoteVariable =
++      new GlobalVariable(M,
++                         /*Type=*/ElfNoteType,
++                         /*isConstant=*/true,
++                         /*Linkage=*/GlobalValue::PrivateLinkage,
++                         /*Initializer=*/ElfNoteConstant,
++                         /*Name=*/"CallHierarchyNote");
++  NoteVariable->setAlignment(MaybeAlign(4));
++  NoteVariable->setSection(".note.callhierarchy");
++
++  appendToUsed(M, {NoteVariable});
++
++  return PreservedAnalyses::all();
++}
